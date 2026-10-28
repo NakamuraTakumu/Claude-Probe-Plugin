@@ -1,5 +1,5 @@
 // probe: a read-only investigation tool `probe`, run by hidden haiku
-// subagents of this session (no external CLI, no `claude -p`). See README.md.
+// subagents of this session (no external CLI, no `claude -p`). See docs/design.md.
 //
 //   probe:probe         agent type (hidden from the model by agent.offer)
 //   mcp__probe__probe   tool the parent calls; one hidden subagent per question
@@ -484,7 +484,7 @@ async function isProbeAgent($, agentId) {
 }
 
 // Debugging aid, off by default: while PROBE_TRACE names a file, every delivery that looks like
-// an agent message is summarised, as each hook sees it, into that file (see README).
+// an agent message is summarised, as each hook sees it, into that file (see docs/design.md).
 
 function textOfEvent(e) {
   if (typeof e.text === 'string') return e.text
