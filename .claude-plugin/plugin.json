@@ -1,0 +1,9 @@
+{
+  "name": "probe",
+  "version": "0.3.0",
+  "description": "Read-only investigation tool `probe`, run by hidden haiku subagents of the current session (no external CLI, no claude -p).",
+  "author": {
+    "name": "nakamura"
+  },
+  "license": "MIT"
+}
