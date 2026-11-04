@@ -1059,7 +1059,7 @@ test('Bash of a probe subagent runs inside bwrap: read-only file system, TMPDIR 
   await asAgent($, 'p1', { tool: 'Bash', command })
   expect(w.bash).toEqual([wrapCommand(command)])
   expect(w.bash[0]).toBe(
-    `bwrap --ro-bind / / --dev /dev --proc /proc --setenv TMPDIR /dev/shm --die-with-parent -- bash -c ${shQuote(command)}`,
+    `bwrap --ro-bind / / --dev /dev --proc /proc --setenv TMPDIR /dev/shm --unshare-net --die-with-parent -- bash -c ${shQuote(command)}`,
   )
   expect(w.bash[0]).toContain(`'echo '\\''it'\\'''\\''s'\\''; ls "$HOME" | head -3'`)
   // others are not touched: another subagent, the main loop
@@ -1112,9 +1112,28 @@ test('sandbox: checked once per probe call, by its first child Bash; a later cal
   expect(checks()).toBe(4)
 })
 
-test('with a sandbox, tool.check leaves the Bash of a probe subagent to the engine', async ($, on) => {
+test('with a sandbox, the Bash of a probe subagent the engine would put to the person is allowed; its allow and deny stand', async ($, on) => {
+  let engine = 'ask'
+  on('tool.check', () => ({ decision: engine, reason: 'engine' }))
+  world($, on, { agents: [{ id: 'p1', type: AGENT, status: 'running', description: 'probe' }, { id: 'o1', type: 'general-purpose', status: 'running', description: 'x' }] })
+  await start($)
+  const r = await bashCheck($, 'p1', false)
+  expect(r.decision).toBe('allow')
+  expect(r.reason).toContain('ネットワークなし')
+  engine = 'deny'
+  expect((await bashCheck($, 'p1', false)).decision).toBe('deny')
+  engine = 'allow'
+  expect((await bashCheck($, 'p1', false)).reason).toBe('engine')
+  // others' asks stay asks
+  engine = 'ask'
+  expect((await bashCheck($, 'o1', false)).decision).toBe('ask')
+  expect((await bashCheck($, undefined, false)).decision).toBe('ask')
+})
+
+test('PROBE_SANDBOX=off: an ask for the Bash of a probe subagent stays an ask', async ($, on) => {
+  mock.env(on, { PROBE_SANDBOX: 'off' })
   on('tool.check', () => ({ decision: 'ask', reason: 'engine' }))
-  world($, on, { agents: [{ id: 'p1', type: AGENT, status: 'running', description: 'probe' }] })
+  world($, on, { bwrap: false, agents: [{ id: 'p1', type: AGENT, status: 'running', description: 'probe' }] })
   await start($)
   expect((await bashCheck($, 'p1', false)).decision).toBe('ask')
 })
@@ -1496,7 +1515,7 @@ test('outcomeOf, taskIdsOf, handbackSendersOf, shQuote and wrapCommand', () => {
   expect(outcomeOf({ reason: 'refusal', answer: 'no' }).text).toBe('ERROR: 応答を拒否した\nno')
   expect(taskIdsOf('<task-id> a1 </task-id> x <task-id>b2</task-id>')).toEqual(['a1', 'b2'])
   expect(shQuote("a'b")).toBe(`'a'\\''b'`)
-  expect(BWRAP_ARGS).toEqual(['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--setenv', 'TMPDIR', '/dev/shm', '--die-with-parent'])
+  expect(BWRAP_ARGS).toEqual(['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--setenv', 'TMPDIR', '/dev/shm', '--unshare-net', '--die-with-parent'])
   expect(wrapCommand('ls')).toBe(`bwrap ${BWRAP_ARGS.join(' ')} -- bash -c 'ls'`)
 })
 

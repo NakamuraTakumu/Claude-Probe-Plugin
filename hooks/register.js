@@ -82,13 +82,14 @@ const COMPLETIONS_CAP = 256
 const CHILD_MODEL = 'haiku' // probe always runs on haiku
 
 // Bash of a probe subagent runs inside the first of SANDBOXES whose check runs here (checked once per probe call):
-// the file system read-only, network kept, temp files (mktemp) only for the command's own run.
+// the file system read-only, no network, temp files (mktemp) only for the command's own run. Its calls run
+// unreviewed when auto mode gives no verdict (the wrapping changed them), so nothing in it may write or send.
 // bwrap (Linux): the whole tree read-only; TMPDIR in the /dev bwrap makes for the command.
-export const BWRAP_ARGS = ['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--setenv', 'TMPDIR', '/dev/shm', '--die-with-parent']
-// sandbox-exec (macOS): writes denied but to /dev/null, the terminal and a directory made for the
+export const BWRAP_ARGS = ['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--setenv', 'TMPDIR', '/dev/shm', '--unshare-net', '--die-with-parent']
+// sandbox-exec (macOS): the network denied, writes denied but to /dev/null, the terminal and a directory made for the
 // command (TMP, its real path), removed when it ends.
 const SEATBELT_PROFILE =
-  '(version 1)(allow default)(deny file-write*)(allow file-write* (subpath (param "TMP")) (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty") (regex #"^/dev/fd/"))'
+  '(version 1)(allow default)(deny network*)(deny file-write*)(allow file-write* (subpath (param "TMP")) (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty") (regex #"^/dev/fd/"))'
 export const SANDBOXES = [
   { name: 'bwrap', check: ['bwrap', ...BWRAP_ARGS, '--', 'true'], wrap: wrapCommand },
   {
@@ -105,7 +106,7 @@ const PARKS = [['sleep', '0.5'], ['sleep', '1'], ['ping', '-n', '2', '127.0.0.1'
 
 export const AGENT_PROMPT = [
   '依頼主の代わりに作業場や Web を調べ、コマンドを実行して結果を返す。依頼されたことだけを最短の手順で行う。ファイルは変更しない。',
-  'コマンドはなるべく1回の bash にまとめ、依存しない操作は並列に呼ぶ。Bash のファイルシステムは読み取り専用で、スクラッチパッドにも書けない。',
+  'コマンドはなるべく1回の bash にまとめ、依存しない操作は並列に呼ぶ。Bash のファイルシステムは読み取り専用で、スクラッチパッドにも書けない。Bash からはネットワークにもつながらないので、Web は WebSearch と WebFetch で調べる。',
   `スクリプトはファイルに書かず、python3 - <<'EOF' のように標準入力で渡す。一時ファイルは mktemp で作れるが、そのコマンドが終わると消えるので、同じコマンドの中で使い切る。各 Bash 呼び出しは独立で、cd や環境変数は残らない。`,
   '「## 背景」は参考にする。足りなければ context ツールで依頼主の会話を必要な分だけ読む。',
   `最後のメッセージがそのまま返る。結論を先に、既定では ${DEFAULT_MAX_CHARS} 字以内で書く。依頼の末尾に「結果の上限: N 字」とあれば N 字が上限。長さや形の指定があればそれに従う。前置き・経過・使ったコマンド・注意書きは書かない。`,
@@ -183,6 +184,7 @@ export const CONTEXT_SPEC = {
 const CONTEXT_DENY = 'context は probe の内側からだけ使える。'
 const CONTEXT_OFF_DENY = 'この probe は会話を渡さない指定（context: false）で呼ばれた。質問だけで答える。'
 const READONLY_DENY = 'probe は読み取り専用で、ファイルを変更できない。書き込みが必要な作業は親に戻す。'
+const SANDBOXED_ALLOW = 'probe のサンドボックスの中（ファイルは読み取り専用、ネットワークなし）で実行する。'
 const NO_SANDBOX_DENY = 'この環境には probe の Bash を読み取り専用で包む仕組み（bwrap、sandbox-exec、srt）がない。読み取り専用と判定できるコマンドだけ実行できる。'
 
 // ---------------------------------------------------------------- pure helpers
@@ -933,9 +935,15 @@ export function register(on) {
   })
 
   // No sandbox here: a probe subagent's Bash runs only when Bash itself finds the command read-only.
+  // In the sandbox: auto mode reviews the call as the model wrote it, so the wrapped one gets no verdict and is
+  // put to the person. Such an ask is allowed: the sandbox neither writes nor sends. A deny stays a deny.
   on('tool.check', { tool: 'Bash' }, async ($, e, next) => {
     if (e.agentId === undefined || e.isReadOnly === true || !(await isProbeAgent($, e.agentId))) return next(e)
-    if ((await sandboxOff($)) || (await sandboxOf($, e.agentId)) !== null) return next(e)
+    if (await sandboxOff($)) return next(e)
+    if ((await sandboxOf($, e.agentId)) !== null) {
+      const r = await next(e)
+      return r && r.decision === 'ask' ? { decision: 'allow', reason: SANDBOXED_ALLOW } : r
+    }
     return { decision: 'deny', reason: NO_SANDBOX_DENY }
   }).catch(($, e, next) => (e.agentId !== undefined && probeAgents.has(e.agentId) ? { decision: 'deny', reason: NO_SANDBOX_DENY } : next(e)))
 
