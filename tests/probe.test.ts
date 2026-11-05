@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, BASH_DEFAULT_TIMEOUT_MS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, SANDBOXES, WRAPUP_DENY, wrapupRequest, callLine, scopeText, shortenPrompt, shQuote, stopSeconds, stoppedNote, taskIdsOf, wrapCommand } from '../hooks/register.js'
+import { recordRows, requestsOf, savingsOf, savingsLine, probeGroupOf } from '../hooks/register.js'
+import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, BASH_DEFAULT_TIMEOUT_MS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, reviseRequest, quotesOf, checkQuote, renderAnswer, escapeMarks, sourcesFrom, SANDBOXES, WRAPUP_DENY, wrapupRequest, callLine, callHead, scopeText, onlyStubs, shQuote, stopSeconds, stoppedNote, taskIdsOf, wrapCommand } from '../hooks/register.js'
 
 const AGENT = 'probe:probe'
 const TOOL = 'mcp__probe__probe'
@@ -13,7 +14,7 @@ type Script = { answer?: string; reason?: string; parks?: number; never?: boolea
  * its next run follows `then` of its script), the `sleep` park (the subagents finish
  * there, by script), bwrap, TaskStop and the clock.
  */
-function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; sleep?: boolean; send?: 'refuse' | 'throw'; shorten?: 'ok' | 'long' | 'throw' | 'none'; messages?: any[] | 'throw' | 'deny'; usage?: string | 'missing'; sleepFails?: number; script?: (prompt: string, n: number) => Script; agents?: any[]; listThrows?: boolean; clockThrows?: boolean; names?: Record<string, string>; trace?: boolean; childMessages?: Record<string, any[] | 'throw'>; bashOut?: { stdout: string; stderr?: string; isError?: boolean } } = {}) {
+function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; sleep?: boolean; send?: 'refuse' | 'throw'; messages?: any[] | 'throw' | 'deny'; usage?: string | 'missing'; sleepFails?: number; script?: (prompt: string, n: number) => Script; agents?: any[]; listThrows?: boolean; clockThrows?: boolean; names?: Record<string, string>; trace?: boolean; childMessages?: Record<string, any[] | 'throw'>; liveTranscript?: boolean; outputs?: Record<string, string>; bashOut?: { stdout: string; stderr?: string; isError?: boolean }; files?: Record<string, string> } = {}) {
   if (options.clockThrows) on('clock.now', () => { throw new Error('boom') })
   const w = {
     clock: options.clockThrows ? (undefined as any) : mock.clock(on),
@@ -33,10 +34,12 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
     parks: 0,
     traced: [] as any[],
     toasts: [] as string[],
+    logs: [] as string[],
     invalidated: [] as any[],
     sleepFails: options.sleepFails ?? 0,
     onPark: [] as Array<() => Promise<void>>,
     agents: options.agents ?? ([] as any[]),
+    uses: new Map<string, any[]>(), // a subagent's tool calls as its transcript keeps them (liveTranscript)
   }
   const script = options.script ?? ((p: string) => ({ answer: 'answer: ' + p }))
   on('agent.register', (_$: any, e: any) => { w.registered.agent = e; return { value: { agent: AGENT } } })
@@ -51,6 +54,7 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
     // a probe subagent's own transcript (read for the scope list under its answer)
     if (e && typeof e.agentId === 'string' && e.agentId.startsWith('agent-')) {
       if ((options.childMessages as any)?.[e.agentId] === 'throw') throw new Error('transcript down')
+      if (options.childMessages?.[e.agentId] === undefined && options.liveTranscript) return { value: [{ role: 'assistant', text: '', toolUses: w.uses.get(e.agentId) ?? [] }] }
       return { value: options.childMessages?.[e.agentId] ?? [] }
     }
     w.messageCalls.push(e)
@@ -66,12 +70,26 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
   })
   on('agent.offer', () => ({ isOffered: true }))
   on('prompt.attachment', (_$: any, e: any) => ({ text: e.text }))
-  if (options.trace) mock.env(on, { PROBE_TRACE: '/log/probe-trace.log' })
+  if (options.trace || options.files) mock.env(on, { ...(options.trace ? { PROBE_TRACE: '/log/probe-trace.log' } : {}), ...(options.files ? { HOME: '/home/u' } : {}) })
+  // Transcript files (the savings line reads them): `files` maps an absolute path to its text.
+  const files = options.files ?? {}
   on('fs.read', (_$: any, e: any) => {
     w.reads.push(String(e.path))
+    if (files[e.path] !== undefined) return { value: files[e.path] }
     if (options.usage === 'missing') throw new Error('ENOENT')
     return { value: options.usage ?? 'USAGE-RULES\nwhen to use probe' }
   })
+  on('fs.list', (_$: any, e: any) => {
+    const names = new Set(Object.keys(files).filter((p) => p.startsWith(e.path + '/')).map((p) => p.slice(e.path.length + 1).split('/')[0]))
+    return { value: [...names].map((name) => ({ name, kind: Object.keys(files).some((p) => p.startsWith(`${e.path}/${name}/`)) ? 'dir' : 'file', size: 0, mtimeMs: 0, isLink: false })) }
+  })
+  on('fs.exists', (_$: any, e: any) => ({ value: files[e.path] !== undefined || Object.keys(files).some((p) => p.startsWith(e.path + '/')) }))
+  on('fs.stat', (_$: any, e: any) => {
+    if (files[e.path] === undefined) throw new Error('ENOENT')
+    return { value: { kind: 'file', size: new TextEncoder().encode(files[e.path]).length, mtimeMs: 0, isLink: false } }
+  })
+  on('session.id', () => ({ value: 'S1' }))
+  on('ui.log', (_$: any, e: any) => { w.logs.push(String(e.text ?? e)); return { value: undefined } })
   on('prompt.section', (_$: any, e: any) => ({ text: e.text }))
   on('ui.invalidate', (_$: any, e: any) => { w.invalidated.push(e.event ?? e); return { value: undefined } })
   on('prompt.submit', (_$: any, e: any) => ({ text: e.text }))
@@ -108,12 +126,10 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
     w.live.set(id, { prompt: e.text, script: prev.then ?? { answer: 'rewritten' }, parks: 0 })
     return { isDelivered: true }
   })
+  // probe never calls a model itself (only its subagents write answers): recorded to show it.
   const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
   on('model.complete', (_$: any, e: any) => {
     w.completes.push(e)
-    if (options.shorten === 'throw') throw new Error('model down')
-    if (options.shorten === 'ok') return { value: { isAnswered: true, text: ' 要約: ' + 'k'.repeat(100) + ' ', usage } }
-    if (options.shorten === 'long') return { value: { isAnswered: true, text: 'L'.repeat(9000), usage } }
     return { value: { isAnswered: false, reason: 'api-error', status: 500, error: 'server_error', usage } }
   })
   on('tool.call', { tool: 'TaskStop' }, (_$: any, e: any) => { w.stopped.push(e.task_id); w.live.delete(e.task_id); return { result: { message: 'stopped' }, text: 'stopped' } })
@@ -125,7 +141,12 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
       if (b.isError) return { isError: true, result: 'Exit code 3\n' + b.stdout, text: 'Exit code 3\n' + b.stdout }
       return { result: { stdout: b.stdout, stderr: b.stderr ?? '', interrupted: false }, text: b.stdout }
     }
-    return { result: 'ok', text: 'ok' }
+    const text = options.outputs?.[e.tool] ?? 'ok'
+    if (options.liveTranscript && typeof e.agentId === 'string') {
+      const { tool, agentId, tool_use_id, ...input } = e
+      w.uses.set(agentId, [...(w.uses.get(agentId) ?? []), { tool_use_id, tool, input, text }])
+    }
+    return { result: text, text }
   })
   on('process.run', async (_$: any, e: any) => {
     const argv: string[] = e.argv
@@ -162,7 +183,7 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
 
 // Every answer carries its scope list; with the test engine's empty transcripts it says no tool was
 // called. Tests about other things read the answer without it (the scope tests read it whole).
-const NO_CALLS = '\n\n調べた範囲（呼び出し 0 回）：ツールは使っていない。'
+const NO_CALLS = '\n\n〔調べた範囲（呼び出し 0 回）：ツールは使っていない〕'
 const bare = (t: any) => (typeof t === 'string' ? t.split(NO_CALLS).join('') : t)
 
 const offerInput = (agent: string) => ({ agent, description: 'd', source: 'plugin', provider: { plugin: 'x', tier: 'user' } }) as any
@@ -192,6 +213,9 @@ test('session.start registers the hidden probe agent and the probe tool', async 
   expect(a.prompt).toContain('結果の上限: N 字')
   expect(a.prompt).toContain('長さや形の指定があればそれに従う')
   expect(a.prompt).toContain('前置き・経過・使ったコマンド・注意書きは書かない')
+  expect(a.prompt).toContain('言い換えずに原文のままコードで書く')
+  expect(a.prompt).not.toContain('〔出力 #')
+  expect(a.prompt).toContain('ファイルは Read で読み、その出力を写す')
   const t = w.registered.tool
   expect(t.name).toBe('probe')
   expect(t.inputSchema.required).toEqual(['questions'])
@@ -205,7 +229,7 @@ test('session.start registers the hidden probe agent and the probe tool', async 
     '読み取り専用のシェルで調べて、結論か関係する原文の引用だけを返す。ファイルの検索、コマンドやテストの実行、Web 検索ができ、条件を明示すれば分岐を含む手順も任せられる。' +
       '向くのは、どこにあるか分からないものを広く探すとき、多くのファイルにまたがるとき、長い出力（ログ、コマンドの出力）から要点だけ欲しいとき、Web で調べるとき。これから編集する箇所と、すぐ済む確認は自分でやる。' +
       '判断は、基準を問いに書けるなら任せられる。会話全体の文脈や好みに依る判断は任せず、材料集めに使う。' +
-      '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれる。答えの後ろには、調べた範囲（使ったツールの一覧）が付く。',
+      '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれる。〔〕 は probe が付ける印。答えの中のコード（インラインのコードとコードブロック）は、印がなければツールの出力と照合済みの原文。コードブロックには出どころが 〔一致：…〕 で付く。原文でないと書き手が示したコードには 〔非引用〕、照合できなかったコードには 〔一致しない〕 が付く。WebFetch の出力はページの原文ではなく要約なので、Web の内容は原文と照合されていない。答えの後ろには、調べた範囲（使ったツールの一覧）が付く。',
   )
   expect(Object.keys(t.inputSchema.properties)).toEqual(['questions', 'cwd', 'max_chars', 'context', 'effort'])
   expect(t.inputSchema.properties.questions.description).toContain('複数書くと並列に処理され、結果はまとめて返る（最大4件同時')
@@ -231,7 +255,7 @@ test('probe: one subagent per task, results numbered in task order with no file 
   await start($)
   const r = await probe($, { questions: ['t1', 't2', 't3'], cwd: '/work' })
   expect(typeof r.result).toBe('string')
-  expect(bare(r.result)).toBe('## 1\nanswer: t1\n\n## 2\nanswer: t2\n\n## 3\nanswer: t3')
+  expect(bare(r.result)).toBe('〔問い 1〕\nanswer: t1\n\n〔問い 2〕\nanswer: t2\n\n〔問い 3〕\nanswer: t3')
   expect(bare(r.result)).not.toContain('全文')
   expect(w.spawns.map((s: any) => s.subagent_type)).toEqual([AGENT, AGENT, AGENT])
   expect(w.spawns.map((s: any) => s.run_in_background)).toEqual([true, true, true])
@@ -257,7 +281,7 @@ test('probe: at most 4 subagents at a time, the rest wait for a free place', asy
   const r = await probe($, { questions: ['a', 'b', 'c', 'd', 'e', 'f'] })
   expect(w.spawns.length).toBe(6)
   expect(w.maxLive).toBe(4)
-  expect(bare(r.result)).toBe(['1', '2', '3', '4', '5', '6'].map((i) => `## ${i}\nok`).join('\n\n'))
+  expect(bare(r.result)).toBe(['1', '2', '3', '4', '5', '6'].map((i) => `〔問い ${i}〕\nok`).join('\n\n'))
 })
 
 test('probe: a failed task shows its error in its own section, the others stay', async ($, on) => {
@@ -267,7 +291,7 @@ test('probe: a failed task shows its error in its own section, the others stay',
   await start($)
   const r = await probe($, { questions: ['ok', 'bad', 'err'] })
   expect(bare(r.deny)).toBe(undefined)
-  expect(bare(r.result)).toBe('## 1\nfine\n\n## 2\nERROR: 開始できなかった: no capacity\n\n## 3\nERROR: エラーで終了した\nhalf')
+  expect(bare(r.result)).toBe('〔問い 1〕\nfine\n\n〔問い 2〕\nERROR: 開始できなかった: no capacity\n\n〔問い 3〕\nERROR: エラーで終了した\nhalf')
   expect(w.spawns.length).toBe(3)
 })
 
@@ -277,8 +301,8 @@ test('probe: every task failing is a deny, not a result', async ($, on) => {
   const r = await probe($, { questions: ['a', 'b'] })
   expect(bare(r.result)).toBe(undefined)
   expect(bare(r.deny)).toContain('すべての問いが失敗した')
-  expect(bare(r.deny)).toContain('## 1\nERROR: 開始できなかった: nope')
-  expect(bare(r.deny)).toContain('## 2\nERROR')
+  expect(bare(r.deny)).toContain('〔問い 1〕\nERROR: 開始できなかった: nope')
+  expect(bare(r.deny)).toContain('〔問い 2〕\nERROR')
   // a single failed question: deny with the bare text
   const one = await probe($, { questions: ['z'] })
   expect(bare(one.deny)).toBe('probe: すべての問いが失敗した。\nERROR: 開始できなかった: nope')
@@ -290,7 +314,7 @@ test('probe: a task that never finishes is asked for its answer so far at 15 min
   const r = await probe($, { questions: ['fast', 'slow'] })
   expect(w.sends.map((x) => x.text)).toEqual([wrapupRequest(15, 2000)])
   expect(w.stopped).toEqual(['agent-2'])
-  expect(bare(r.result)).toBe('## 1\nquick\n\n## 2\nERROR: タイムアウト（15 分）。途中までの答えも 2 分で返らなかった。処理を停止した。')
+  expect(bare(r.result)).toBe('〔問い 1〕\nquick\n\n〔問い 2〕\nERROR: タイムアウト（15 分）。途中までの答えも 2 分で返らなかった。処理を停止した。')
   expect(w.clock.now()).toBeGreaterThan(17 * 60 * 1000 - 1)
   expect((await $.agent.offer(offerInput(AGENT))).isOffered).toBe(false) // the window is shut again
 })
@@ -315,13 +339,13 @@ test('wrap-up: the answer so far comes back as an answer like any other, and the
   expect(w.stopped).toEqual([])
 })
 
-test('wrap-up: an answer so far above the bound is shortened, not sent back for a rewrite', async ($, on) => {
-  const w = world($, on, { shorten: 'ok', script: () => ({ never: true, wrapup: { answer: longText(2500) } }) })
+test('wrap-up: an answer so far above the bound is cut, not sent back for a rewrite', async ($, on) => {
+  const w = world($, on, { script: () => ({ never: true, wrapup: { answer: longText(2500) } }) })
   await start($)
   const r = await probe($, { questions: ['x'] })
   expect(w.sends.length).toBe(1) // the wrap-up request only
-  expect(w.completes.length).toBe(1)
-  expect(bare(r.result)).toContain('要約')
+  expect(w.completes.length).toBe(0)
+  expect(bare(r.result)).toBe(`${longText(2000)}\n〔切り詰め：元は 2500 字〕`)
 })
 
 test('wrap-up: when the request cannot be delivered the task is stopped at once, as before', async ($, on) => {
@@ -431,7 +455,7 @@ test('rewrite: an answer within the bound (at it, too) is never sent back', asyn
   const w = world($, on, { script: (p) => ({ answer: p === 'edge' ? longText(2000) : 'short' }) })
   await start($)
   const r = await probe($, { questions: ['edge', 'small'] })
-  expect(bare(r.result)).toBe(`## 1\n${longText(2000)}\n\n## 2\nshort`)
+  expect(bare(r.result)).toBe(`〔問い 1〕\n${longText(2000)}\n\n〔問い 2〕\nshort`)
   expect(w.sends).toEqual([])
   expect(w.spawns.length).toBe(2)
 })
@@ -457,7 +481,7 @@ test('rewrite: the bound of max_chars is the one asked for, and it applies to ev
   })
   await start($)
   const r = await probe($, { questions: ['long', 'fine', 'slow'], max_chars: 500 })
-  expect(bare(r.result)).toBe(`## 1\nnow short\n\n## 2\n${longText(500)}\n\n## 3\n${longText(100)}`)
+  expect(bare(r.result)).toBe(`〔問い 1〕\nnow short\n\n〔問い 2〕\n${longText(500)}\n\n〔問い 3〕\n${longText(100)}`)
   expect(w.sends.map((s) => [s.to, s.text])).toEqual([
     ['agent-1', '結果が 700 字で、上限 500 字を超えた。結論を先に、500 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。'],
     ['agent-3', '結果が 900 字で、上限 500 字を超えた。結論を先に、500 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。'],
@@ -472,7 +496,7 @@ test('rewrite: two requests at most; if the third answer is still above the boun
     '結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。',
     '結果が 2300 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。',
   ])
-  expect(bare(r.result)).toBe(`${longText(2000, 'y')}\n…(切り詰め。元は 2200 文字)`)
+  expect(bare(r.result)).toBe(`${longText(2000, 'y')}\n〔切り詰め：元は 2200 字〕`)
   expect(w.spawns.length).toBe(1)
   expect(w.live.size).toBe(0)
   expect(w.stopped).toEqual([])
@@ -494,7 +518,7 @@ test('rewrite: the 15 minutes count from the start, the rewrite included; a rewr
   const r = await probe($, { questions: ['x'] })
   expect(w.sends.length).toBe(1)
   expect(w.stopped).toEqual(['agent-1'])
-  expect(bare(r.result)).toBe(`${longText(2000)}\n…(切り詰め。元は 2500 文字。書き直し中に 15 分でタイムアウト)`)
+  expect(bare(r.result)).toBe(`${longText(2000)}\n〔切り詰め：元は 2500 字。書き直し中に 15 分でタイムアウト〕`)
   const t = w.clock.now()
   expect(t).toBeGreaterThan(15 * 60 * 1000 - 1)
   expect(t).toBeLessThan(16 * 60 * 1000) // not 14 + 3 minutes
@@ -506,7 +530,7 @@ test('rewrite: a rewrite that does not come back in 3 minutes is given up (the 1
   await start($)
   const r = await probe($, { questions: ['x'] })
   expect(w.stopped).toEqual(['agent-1'])
-  expect(bare(r.result)).toBe(`${longText(2000)}\n…(切り詰め。元は 2500 文字。書き直しが 3 分で終わらなかった)`)
+  expect(bare(r.result)).toBe(`${longText(2000)}\n〔切り詰め：元は 2500 字。書き直しが 3 分で終わらなかった〕`)
   expect(w.clock.now()).toBeLessThan(10 * 60 * 1000)
   expect((await $.agent.offer(offerInput(AGENT))).isOffered).toBe(false)
 })
@@ -518,7 +542,7 @@ test('rewrite: a rewrite that gets stuck does not hold up the other tasks, a pla
   await start($)
   const r = await probe($, { questions: ['quick', 'hang', 'rw'] })
   expect(w.stopped.sort()).toEqual(['agent-2', 'agent-3'])
-  expect(bare(r.result)).toBe(`## 1\nquick\n\n## 2\nERROR: タイムアウト（15 分）。途中までの答えも 2 分で返らなかった。処理を停止した。\n\n## 3\n${longText(2000)}\n…(切り詰め。元は 3000 文字。書き直しが 3 分で終わらなかった)`)
+  expect(bare(r.result)).toBe(`〔問い 1〕\nquick\n\n〔問い 2〕\nERROR: タイムアウト（15 分）。途中までの答えも 2 分で返らなかった。処理を停止した。\n\n〔問い 3〕\n${longText(2000)}\n〔切り詰め：元は 3000 字。書き直しが 3 分で終わらなかった〕`)
 })
 
 for (const send of ['refuse', 'throw'] as const) {
@@ -527,7 +551,7 @@ for (const send of ['refuse', 'throw'] as const) {
     await start($)
     const r = await probe($, { questions: ['x'] })
     expect(w.sends.length).toBe(1)
-    expect(bare(r.result)).toBe(`${longText(2000)}\n…(切り詰め。元は 2600 文字)`)
+    expect(bare(r.result)).toBe(`${longText(2000)}\n〔切り詰め：元は 2600 字〕`)
     expect(w.spawns.length).toBe(1)
   })
 }
@@ -538,7 +562,7 @@ for (const [name, then] of [['an error', { answer: 'half', reason: 'error' }], [
     await start($)
     const r = await probe($, { questions: ['x'] })
     expect(w.sends.length).toBe(1)
-    expect(bare(r.result)).toBe(`${longText(2000)}\n…(切り詰め。元は 2300 文字)`)
+    expect(bare(r.result)).toBe(`${longText(2000)}\n〔切り詰め：元は 2300 字〕`)
     expect(bare(r.deny)).toBe(undefined)
   })
 }
@@ -549,7 +573,7 @@ test('rewrite: a failed task is not sent back, and an error with a long partial 
   const r = await probe($, { questions: ['ok', 'err'] })
   expect(w.sends.length).toBe(0)
   const partial = 'ERROR: エラーで終了した\n' + longText(5000)
-  expect(bare(r.result)).toBe(`## 1\nfine\n\n## 2\n${partial.slice(0, 2000)}\n…(切り詰め。元は ${partial.length} 文字)`)
+  expect(bare(r.result)).toBe(`〔問い 1〕\nfine\n\n〔問い 2〕\n${partial.slice(0, 2000)}\n〔切り詰め：元は ${partial.length} 字〕`)
 })
 
 test('rewrite: the hand-backs and notifications of a rewritten subagent are dropped like the first ones', async ($, on) => {
@@ -623,7 +647,7 @@ test('rewrite: with several rewrites out the type stays offered until the last o
   const seen: Array<[number, boolean]> = []
   w.onPark.push(async () => { seen.push([w.sends.length, (await $.agent.offer(offerInput(AGENT))).isOffered]) })
   const r = await probe($, { questions: ['a', 'b'] })
-  expect(bare(r.result)).toBe('## 1\na-short\n\n## 2\nb-short')
+  expect(bare(r.result)).toBe('〔問い 1〕\na-short\n\n〔問い 2〕\nb-short')
   for (const [sent, offered] of seen) expect(offered).toBe(sent > 0)
   expect((await $.agent.offer(offerInput(AGENT))).isOffered).toBe(false)
   // and the next call starts from nothing
@@ -639,79 +663,48 @@ test('rewrite: a request that is not delivered leaves the type hidden', async ($
   expect((await $.agent.offer(offerInput(AGENT))).isOffered).toBe(false)
 })
 
-test('fallback: when the rewrite cannot be asked for, one tool-less completion shortens the answer (marked)', async ($, on) => {
-  const w = world($, on, { send: 'refuse', shorten: 'ok', script: () => ({ answer: longText(2600) }) })
+test('fallback: when the rewrite cannot be asked for, the answer is cut (marked); nothing else writes it', async ($, on) => {
+  const w = world($, on, { send: 'refuse', script: () => ({ answer: longText(2600) }) })
   await start($)
   const r = await probe($, { questions: ['調べて: foo'], max_chars: 500 })
-  expect(bare(r.result)).toBe('要約: ' + 'k'.repeat(100) + '\n…(要約。元は 2600 文字)')
+  expect(bare(r.result)).toBe(`${longText(500)}\n〔切り詰め：元は 2600 字〕`)
   expect(w.spawns.length).toBe(1)
-  expect(w.completes.length).toBe(1)
-  const req = w.completes[0]
-  expect(req.model).toBe('haiku')
-  expect(req.prompt).toContain('500 字以内に書き直す')
-  expect(req.prompt).toContain('調べて: foo')
-  expect(req.prompt).toContain('【答え（2600 字）】')
-  expect(req.prompt).toContain(longText(2600))
-  expect(req.maxTokens).toBe(1024)
-  expect(req.effort).toBe('low')
-  expect(req.timeoutMs).toBe(60000)
+  expect(w.completes.length).toBe(0)
 })
 
-test('fallback: also when the rewrite ran into an error, and for every answer alone', async ($, on) => {
+test('fallback: a rewrite that ran into an error leaves the last answer, cut; the others stand alone', async ($, on) => {
   const w = world($, on, {
-    shorten: 'ok',
     script: (p) => (p === 'a' ? { answer: longText(2300), then: { answer: 'half', reason: 'error' } } : p === 'b' ? { answer: 'fine' } : { answer: longText(2400), then: { answer: 'short now' } }),
   })
   await start($)
   const r = await probe($, { questions: ['a', 'b', 'c'] })
-  expect(bare(r.result)).toBe(`## 1\n要約: ${'k'.repeat(100)}\n…(要約。元は 2300 文字)\n\n## 2\nfine\n\n## 3\nshort now`)
-  expect(w.completes.length).toBe(1)
+  expect(bare(r.result)).toBe(`〔問い 1〕\n${longText(2000)}\n〔切り詰め：元は 2300 字〕\n\n〔問い 2〕\nfine\n\n〔問い 3〕\nshort now`)
+  expect(w.completes.length).toBe(0)
 })
 
-test('fallback: a rewrite that gets stuck is shortened too', async ($, on) => {
-  const w = world($, on, { shorten: 'ok', script: () => ({ answer: longText(2500), then: { never: true } }) })
-  await start($)
-  const r = await probe($, { questions: ['x'] })
-  expect(w.stopped).toEqual(['agent-1'])
-  expect(bare(r.result)).toBe(`要約: ${'k'.repeat(100)}\n…(要約。元は 2500 文字)`)
-})
-
-for (const shorten of ['none', 'long', 'throw'] as const) {
-  test(`fallback: if shortening gives nothing usable (${shorten}) the answer is cut, marked`, async ($, on) => {
-    const w = world($, on, { send: 'refuse', shorten, script: () => ({ answer: longText(2600) }) })
-    await start($)
-    const r = await probe($, { questions: ['x'] })
-    expect(w.completes.length).toBe(1)
-    expect(bare(r.result)).toBe(`${longText(2000)}\n…(切り詰め。元は 2600 文字)`)
-  })
-}
-
-test('fallback: not used when the rewrite works, nor after two rewrites that stay long (those are cut)', async ($, on) => {
+test('fallback: after two rewrites that stay long the answer is cut', async ($, on) => {
   const w = world($, on, {
-    shorten: 'ok',
     script: (p) => (p === 'a' ? { answer: longText(2500), then: { answer: 'short' } } : { answer: longText(2500), then: { answer: longText(2400), then: { answer: longText(2300, 'y') } } }),
   })
   await start($)
   const r = await probe($, { questions: ['a', 'b'] })
-  expect(bare(r.result)).toBe(`## 1\nshort\n\n## 2\n${longText(2000, 'y')}\n…(切り詰め。元は 2300 文字)`)
+  expect(bare(r.result)).toBe(`〔問い 1〕\nshort\n\n〔問い 2〕\n${longText(2000, 'y')}\n〔切り詰め：元は 2300 字〕`)
   expect(w.completes.length).toBe(0)
 })
 
-test('trace: the outcome of a rewrite request and of the shortening is logged while PROBE_TRACE is set', async ($, on) => {
-  const w = world($, on, { trace: true, send: 'refuse', shorten: 'ok', script: () => ({ answer: longText(2600) }) })
+test('trace: the outcome of a rewrite request is logged while PROBE_TRACE is set', async ($, on) => {
+  const w = world($, on, { trace: true, send: 'refuse', script: () => ({ answer: longText(2600) }) })
   await start($)
   await probe($, { questions: ['x'] })
   const rewrite = w.traced.find((t: any) => t.hook === 'rewrite')
-  expect(rewrite).toMatchObject({ agentId: 'agent-1', delivered: false, reason: 'nobody by that name', length: 2600, max: 2000 })
-  const shorten = w.traced.find((t: any) => t.hook === 'shorten')
-  expect(shorten).toMatchObject({ ok: true, length: 2600, max: 2000 })
+  expect(rewrite).toMatchObject({ agentId: 'agent-1', delivered: false, reason: 'nobody by that name', length: 2600, max: 2000, quotes: 0 })
 })
 
 test('trace: a delivered rewrite is logged, and nothing is written without PROBE_TRACE', async ($, on) => {
   const on1 = world($, on, { trace: true, script: () => ({ answer: longText(2500), then: { answer: 'short' } }) })
   await start($)
   await probe($, { questions: ['x'] })
-  expect(on1.traced.filter((t: any) => t.hook === 'rewrite')).toEqual([{ hook: 'rewrite', agentId: 'agent-1', delivered: true, length: 2500, max: 2000 }])
+  expect(on1.traced.filter((t: any) => t.hook === 'rewrite')).toEqual([{ hook: 'rewrite', agentId: 'agent-1', delivered: true, length: 2500, max: 2000, quotes: 0 }])
 })
 
 test('trace: no PROBE_TRACE, no line', async ($, on) => {
@@ -1443,12 +1436,13 @@ test('trace: with PROBE_TRACE, the event as each hook saw it is summarised in th
   await attach($, 'no message here')
   await peer($, handback('p1'), 'peer', 'turn-1')
   await peer($, handback('p1'))
-  expect(w.traced.length).toBe(3)
+  expect(w.traced.length).toBe(4)
   expect(w.ran.filter((a: any) => a[0] === 'sh').every((a: any) => a[4] === '/log/probe-trace.log')).toBe(true)
-  expect(w.traced[0]).toMatchObject({ hook: 'prompt.attachment', note: 'left out', type: 'queued_command', agentId: 'spawner' })
-  expect(w.traced[0].text).toContain('<agent-message from="p1">')
-  expect(w.traced[1]).toMatchObject({ hook: 'prompt.submit', note: 'passed to the queue', origin: { kind: 'peer' }, turnId: 'turn-1' })
-  expect(w.traced[2]).toMatchObject({ hook: 'prompt.submit', note: 'dropped', origin: { kind: 'peer' } })
+  expect(w.traced[0]).toMatchObject({ hook: 'prompt.attachment (any)', type: 'queued_command', agentId: 'spawner' })
+  expect(w.traced[1]).toMatchObject({ hook: 'prompt.attachment', note: 'left out', type: 'queued_command', agentId: 'spawner' })
+  expect(w.traced[1].text).toContain('<agent-message from="p1">')
+  expect(w.traced[2]).toMatchObject({ hook: 'prompt.submit', note: 'passed to the queue', origin: { kind: 'peer' }, turnId: 'turn-1' })
+  expect(w.traced[3]).toMatchObject({ hook: 'prompt.submit', note: 'dropped', origin: { kind: 'peer' } })
 })
 
 test('fallback: an attachment row of a probe subagent\'s hand-back is cut to a stub', async ($, on) => {
@@ -1466,6 +1460,43 @@ test('fallback: an attachment row of a probe subagent\'s hand-back is cut to a s
   expect(cut.message.content[0].text).not.toContain('long long report')
   const keep = reminder(agentMessage('o1'))
   expect((await append(keep)).message.content[0].text).toBe(keep)
+})
+
+// A request carries a row as stored, so a delivery cut at session.append reaches prompt.attachment as its stub.
+const HANDBACK_STUB_TEXT = 'probe: probe の hand-back（内容は tool の結果に含まれている）'
+const NOTIFICATION_STUB_TEXT = 'probe: probe の完了通知（内容は tool の結果に含まれている）'
+
+test('a delivery cut to a stub is left out of the request; a message of the person quoting one is not', async ($, on) => {
+  world($, on)
+  await start($)
+  const used = '<system-reminder>\n<tools-used-before-summary>Bash</tools-used-before-summary>\n</system-reminder>\n'
+  // As prompt.attachment received it (2026-11-05): the reminder around the tools-used note taken off.
+  const bare = '<tools-used-before-summary>WebSearch</tools-used-before-summary>\n'
+  for (const text of [HANDBACK_STUB_TEXT, used + HANDBACK_STUB_TEXT, used + NOTIFICATION_STUB_TEXT, bare + HANDBACK_STUB_TEXT, `${HANDBACK_STUB_TEXT}\n\n${NOTIFICATION_STUB_TEXT}`]) {
+    expect((await attach($, text)).text).toBe(null)
+  }
+  const said = `The user sent a new message while you were working:\n${HANDBACK_STUB_TEXT}`
+  const keep = [`<system-reminder>\n${said}\n</system-reminder>`, said, `${HANDBACK_STUB_TEXT} と出た`, used, bare]
+  for (const text of keep) expect((await attach($, text)).text).toBe(text)
+  expect(onlyStubs('')).toBe(false)
+})
+
+test('a task-notification row of probe subagents is cut to a stub, only where the engine marks it one', async ($, on) => {
+  world($, on, { agents: [{ id: 'p1', type: AGENT, status: 'completed', description: 'probe' }, { id: 'o1', type: 'general-purpose', status: 'completed', description: 'x' }] })
+  await start($)
+  const append = (text: string, kind: string) =>
+    ($.session.append as any)({
+      message: { type: 'attachment', name: 'queued_command', role: 'user', isMeta: true, content: [{ type: 'text', text }] },
+      door: 'attachment',
+      origin: { kind },
+      uuid: 'a-' + Math.random().toString(36).slice(2),
+    })
+  const note = (id: string) => `<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>${id}</task-id>\n<status>completed</status>\n</task-notification>\n</system-reminder>`
+  expect((await append(note('p1'), 'task-notification')).message.content[0].text).toBe(NOTIFICATION_STUB_TEXT)
+  // another agent's, and a probe's quoted in what the person typed or the engine framed
+  for (const [text, kind] of [[note('o1'), 'task-notification'], [note('p1'), 'composer'], [note('p1'), 'engine']]) {
+    expect((await append(text, kind)).message.content[0].text).toBe(text)
+  }
 })
 
 test('fallback: a hand-back row of a probe subagent that reaches the conversation is cut to a stub', async ($, on) => {
@@ -1529,7 +1560,7 @@ test('a single answer comes back as bare text, two or more get numbered headings
   const w = world($, on)
   await start($)
   expect(bare((await probe($, { questions: ['one'] })).result)).toBe('answer: one')
-  expect(bare((await probe($, { questions: ['one', 'two'] })).result)).toBe('## 1\nanswer: one\n\n## 2\nanswer: two')
+  expect(bare((await probe($, { questions: ['one', 'two'] })).result)).toBe('〔問い 1〕\nanswer: one\n\n〔問い 2〕\nanswer: two')
   const old = await probe($, { tasks: ['one'] })
   expect(bare(old.deny)).toContain('questions')
   expect(w.spawns.length).toBe(3)
@@ -1538,25 +1569,33 @@ test('a single answer comes back as bare text, two or more get numbered headings
 // ------------------------------------------------------------------ pure helpers
 
 test('formatResults numbers sections, caps long answers, writes no path lines', () => {
-  expect(formatResults([{ ok: true, text: 'a' }, { ok: false, text: 'ERROR: b' }])).toBe('## 1\na\n\n## 2\nERROR: b')
+  expect(formatResults([{ ok: true, text: 'a' }, { ok: false, text: 'ERROR: b' }])).toBe('〔問い 1〕\na\n\n〔問い 2〕\nERROR: b')
   // one result: the text alone, no heading (an error too)
   expect(formatResults([{ ok: true, text: 'a' }])).toBe('a')
   expect(formatResults([{ ok: false, text: 'ERROR: b' }])).toBe('ERROR: b')
   const long = formatResults([{ ok: true, text: 'x'.repeat(9000) }])
-  expect(long).toContain('…(切り詰め。元は 9000 文字)')
-  expect(long).toBe('x'.repeat(2000) + '\n…(切り詰め。元は 9000 文字)')
+  expect(long).toContain('〔切り詰め：元は 9000 字〕')
+  expect(long).toBe('x'.repeat(2000) + '\n〔切り詰め：元は 9000 字〕')
   expect(long).not.toContain('全文')
   // the bound is the caller's; an answer exactly at the bound is whole; a reason rides in the mark
   expect(formatResults([{ ok: true, text: 'y'.repeat(800) }], 800)).toBe('y'.repeat(800))
-  expect(formatResults([{ ok: true, text: 'y'.repeat(801) }], 800)).toBe('y'.repeat(800) + '\n…(切り詰め。元は 801 文字)')
-  expect(formatResults([{ ok: true, text: 'z'.repeat(600), why: 'because' }], 500)).toContain('…(切り詰め。元は 600 文字。because)')
+  expect(formatResults([{ ok: true, text: 'y'.repeat(801) }], 800)).toBe('y'.repeat(800) + '\n〔切り詰め：元は 801 字〕')
+  expect(formatResults([{ ok: true, text: 'z'.repeat(600), why: 'because' }], 500)).toContain('〔切り詰め：元は 600 字。because〕')
   // characters, not UTF-16 units
   expect(lengthOf('あい𠮷')).toBe(3)
-  expect(formatResults([{ ok: true, text: '𠮷'.repeat(600) }], 500)).toBe('𠮷'.repeat(500) + '\n…(切り詰め。元は 600 文字)')
+  expect(formatResults([{ ok: true, text: '𠮷'.repeat(600) }], 500)).toBe('𠮷'.repeat(500) + '\n〔切り詰め：元は 600 字〕')
   expect(questionPrompt('調べて', 800)).toBe('調べて\n\n（結果の上限: 800 字）')
-  expect(formatResults([{ ok: true, text: 'abc', note: '…(要約。元は 900 文字)' }], 500)).toBe('abc\n…(要約。元は 900 文字)')
-  expect(shortenPrompt('Q', 'A'.repeat(3), 3, 500)).toBe(['次は調べものの依頼と、その答えである。答えが長すぎるので、500 字以内に書き直す。', '結論を先に書く。数値・名前・ファイル:行・原文の引用など必要な情報だけ残し、経過・前置き・注意書きは削る。答えにないことは書かない。日本語で、書き直した結果だけを返す。', '', '【依頼】', 'Q', '', '【答え（3 字）】', 'AAA'].join('\n'))
   expect(rewriteRequest(2500, 2000)).toBe('結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。')
+})
+
+test('reviseRequest: the length alone is rewriteRequest; failed quotes are listed, with the length when it is over too', () => {
+  expect(reviseRequest(2500, 2000)).toBe(rewriteRequest(2500, 2000))
+  expect(reviseRequest(2500, 2000, [])).toBe(rewriteRequest(2500, 2000))
+  const f = [{ head: 'コードブロック「const TTL = 30」', reason: 'どの出力にもない' }]
+  expect(reviseRequest(undefined, 2000, f)).toBe(
+    ['答えを直して。', '- 次のコードは、読んだ出力のどこにもない。出力から一字も変えずに写し直すか、原文でないなら印を付ける（インラインのコードは直後に（非引用）、コードブロックは開きのフェンスに 非引用）。', '  - コードブロック「const TTL = 30」：どの出力にもない', '直した答えの全体だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。'].join('\n'),
+  )
+  expect(reviseRequest(2500, 2000, f).split('\n')[1]).toBe('- 結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内にする。必要な情報だけ残す。')
 })
 
 test('scope: every tool call of a probe subagent, as the model wrote it, is listed under its answer; errors marked', async ($, on) => {
@@ -1569,6 +1608,7 @@ test('scope: every tool call of a probe subagent, as the model wrote it, is list
         { role: 'assistant', text: '', toolUses: [use('Bash', { command: 'grep -rn foo src\necho more' }), use('Bash', { command: 'grep -rn foo src\necho more' })] },
         { role: 'assistant', text: '', toolUses: [use('Read', { file_path: '/p/a.ts', offset: 10, limit: 5 }), use('WebSearch', { query: 'bwrap unshare-net' })] },
         { role: 'assistant', text: '', toolUses: [use(CONTEXT, { grep: 'x' }), use('Edit', { file_path: '/p/a.ts', old_string: 'a', new_string: 'b' }, { isError: true })] },
+        { role: 'assistant', text: '', toolUses: [use('Bash', { command: 'false\necho x' }, { isError: true }), use('Bash', { command: 'grep -rn foo src\necho less' })] },
         { role: 'assistant', text: '', toolUses: [use('Bash', { command: 'ls' }, { isError: true, text: WRAPUP_DENY }), use('SubagentHandback', { message: 'done' })] },
       ],
     },
@@ -1578,12 +1618,17 @@ test('scope: every tool call of a probe subagent, as the model wrote it, is list
   expect(r.result).toBe([
     'done',
     '',
-    '調べた範囲（呼び出し 6 回）：',
-    '- Bash: grep -rn foo src（2回）',
-    '- Read: /p/a.ts:10-14',
-    '- WebSearch: bwrap unshare-net',
-    `- ${CONTEXT}: {"grep":"x"}`,
-    '- Edit: {"file_path":"/p/a.ts","old_string":"a","new_string":"b"}（エラー）',
+    '〔調べた範囲（呼び出し 8 回）〕',
+    '1. Bash: grep -rn foo src（2回）',
+    '   echo more',
+    '2. Read: /p/a.ts:10-14',
+    '3. WebSearch: bwrap unshare-net',
+    `4. ${CONTEXT}: {"grep":"x"}`,
+    '5. Edit: {"file_path":"/p/a.ts","old_string":"a","new_string":"b"}（エラー）',
+    '6. Bash: false（エラー）',
+    '   echo x',
+    '7. Bash: grep -rn foo src',
+    '   echo less',
   ].join('\n'))
 })
 
@@ -1592,25 +1637,220 @@ test('scope: an answer without tool calls still gets its list, an unreadable tra
   await start($)
   const r = await probe($, { questions: ['ok', 'bad', 'lost'] })
   expect(r.result).toBe(
-    '## 1\nfrom the background alone\n\n調べた範囲（呼び出し 0 回）：ツールは使っていない。\n\n' +
-      '## 2\nERROR: 開始できなかった: nope\n\n' +
-      '## 3\nfrom the background alone\n\n調べた範囲：子の記録を読めなかった。',
+    '〔問い 1〕\nfrom the background alone\n\n〔調べた範囲（呼び出し 0 回）：ツールは使っていない〕\n\n' +
+      '〔問い 2〕\nERROR: 開始できなかった: nope\n\n' +
+      '〔問い 3〕\nfrom the background alone\n\n〔調べた範囲：子の記録を読めなかった〕',
   )
 })
 
-test('callLine and scopeText', () => {
+test('callLine, callHead and scopeText', () => {
   expect(callLine({ tool: 'Grep', pattern: 'a|b', path: '/s', glob: '*.ts' })).toBe('Grep: "a|b" in /s (*.ts)')
   expect(callLine({ tool: 'Glob', pattern: '**/*.md' })).toBe('Glob: **/*.md in .')
   expect(callLine({ tool: 'Read', file_path: '/f', limit: 3 })).toBe('Read: /f:1-3')
   expect(callLine({ tool: 'WebFetch', url: 'https://e.x/a' })).toBe('WebFetch: https://e.x/a')
-  expect(Array.from(callLine({ tool: 'Bash', command: 'x'.repeat(200) })).length).toBe(80)
-  expect(scopeText([])).toBe('調べた範囲（呼び出し 0 回）：ツールは使っていない。')
-  expect(scopeText(['Bash: a', 'Read: /f', 'Bash: a'])).toBe('調べた範囲（呼び出し 3 回）：\n- Bash: a（2回）\n- Read: /f')
+  expect(Array.from(callLine({ tool: 'WebFetch', url: 'https://e.x/' + 'a'.repeat(200) })).length).toBe(80)
+  // a Bash command whole: a long line, a heredoc's script; past 1500 characters the rest is marked
+  expect(callLine({ tool: 'Bash', command: 'x'.repeat(200) })).toBe('Bash: ' + 'x'.repeat(200))
+  const script = "python3 - <<'EOF'\nprint(1)\nEOF"
+  expect(callLine({ tool: 'Bash', command: script + '\n' })).toBe('Bash: ' + script)
+  expect(callLine({ tool: 'Bash', command: 'y'.repeat(2000) })).toBe(('Bash: ' + 'y'.repeat(2000)).slice(0, 1500) + '\n〔以下 506 字略〕')
+  expect(callLine({ tool: 'Bash', command: 'echo 〔一致〕' })).toBe('Bash: echo （一致）') // no forged marks
+  expect(callHead({ tool: 'Bash', command: script })).toBe("Bash: python3 - <<'EOF'…")
+  expect(Array.from(callHead({ tool: 'Bash', command: 'x'.repeat(200) })).length).toBe(80)
+  expect(callHead({ tool: 'Bash', command: 'ls' })).toBe('Bash: ls')
+  expect(scopeText([])).toBe('〔調べた範囲（呼び出し 0 回）：ツールは使っていない〕')
+  expect(scopeText(['Bash: a', 'Read: /f', 'Bash: a'])).toBe('〔調べた範囲（呼び出し 3 回）〕\n1. Bash: a（2回）\n2. Read: /f')
+  // scripts with the same first line are distinct entries, their further lines indented under them
+  expect(scopeText(["Bash: python3 - <<'EOF'\nprint(1)\n\nEOF", "Bash: python3 - <<'EOF'\n  print(2)\nEOF"])).toBe(
+    "〔調べた範囲（呼び出し 2 回）〕\n1. Bash: python3 - <<'EOF'\n   print(1)\n\n   EOF\n2. Bash: python3 - <<'EOF'\n     print(2)\n   EOF",
+  )
   const many = [...Array.from({ length: 18 }, (_, i) => `Bash: c${i}`), 'Bash: c17']
   const t = scopeText(many)
-  expect(t.split('\n')[0]).toBe('調べた範囲（呼び出し 19 回）：')
+  expect(t.split('\n')[0]).toBe('〔調べた範囲（呼び出し 19 回）〕')
   expect(t.split('\n').length).toBe(1 + 15 + 1)
-  expect(t.endsWith('- ほか 3 種類（4回）')).toBe(true)
+  expect(t.split('\n')[15]).toBe('15. Bash: c14')
+  expect(t.endsWith('\nほか 3 種類（4回）')).toBe(true)
+})
+
+// ------------------------------------------------------------------ quotes
+
+const READ_OUT = ['1\tconst a = 1', '2\tconst TTL = 15 * 60   ', '3\t  return TTL', '4\tconst a = 1', '<system-reminder>x</system-reminder>'].join('\n')
+// A subagent's transcript as $.session.messages gives it: the question, then its calls with their outputs.
+const READ_USE = { tool_use_id: 'u1', tool: 'Read', input: { file_path: '/p/a.ts' }, text: READ_OUT }
+const BASH_USE = { tool_use_id: 'u2', tool: 'Bash', input: { command: 'npm test\necho done' }, text: 'PASS a\n  FAIL b   \nend' }
+const transcript = (...uses: any[]) => [{ role: 'user', text: 'where is `TTL` set?', toolUses: [] }, { role: 'assistant', text: '', toolUses: uses }]
+
+test('quotesOf: every fenced block and inline span, as Markdown reads them; 非引用 marks one that is not a quote', () => {
+  const t = [
+    'a `x` and ``y`z`` and `unclosed', // spans; a run of backticks with no partner is text
+    '```js', // a block: the backticks inside are its text, not spans
+    'let `s` = 1',
+    '```',
+    '  - item',
+    '  ```ts 非引用', // in a list: the fence's indentation comes off each line; 非引用 in the info string
+    '    y',
+    '  z',
+    '  ```',
+    '````', // a longer fence holds a shorter one
+    '```',
+    'inner',
+    '```',
+    '````',
+    'see `f(x)`（非引用） and `g`(非引用) and ` h ` and `k` （非引用、説明用の式） and `m` の形、（非引用）',
+    '```', // no end: runs to the end
+    'w',
+  ].join('\n')
+  const q = quotesOf(t)
+  expect(q.map((x: any) => [x.kind, x.body, x.notQuote, x.closed])).toEqual([
+    ['span', 'x', false, true],
+    ['span', 'y`z', false, true],
+    ['block', 'let `s` = 1', false, true],
+    ['block', '  y\nz', true, true],
+    ['block', '```\ninner\n```', false, true],
+    ['span', 'f(x)', true, true],
+    ['span', 'g', true, true],
+    ['span', 'h', false, true],
+    ['span', 'k', true, true], // a why beside it, one space before
+    ['span', 'm', false, true], // words between: not its mark
+    ['block', 'w', false, false],
+  ])
+  expect(q[2].lang).toBe('js')
+  expect(q[3].lang).toBe('ts')
+  expect(q[3].raw).toBe('    y\n  z')
+  expect(t.slice(q[0].start, q[0].end)).toBe('`x`')
+  expect(t.slice(q[5].start, q[5].end)).toBe('`f(x)`（非引用）')
+  expect(q[10].end).toBe(t.length)
+  expect(quotesOf('no code here, < 引用 #1> neither')).toEqual([])
+  expect(quotesOf('```\n```')[0]).toMatchObject({ body: '', raw: undefined, closed: true })
+})
+
+test('checkQuote: looked for in a file\'s lines first (file:lines), then any output, what was typed, the question', () => {
+  const many = { tool_use_id: 'u3', tool: 'Read', input: { file_path: '/m' }, text: Array.from({ length: 5 }, (_, i) => `${i + 1}\tsame`).join('\n') }
+  const pdf = { tool_use_id: 'u4', tool: 'Read', input: { file_path: '/d.pdf' }, text: 'PDF pages extracted: 1\nhello world' }
+  const script = { tool_use_id: 'u5', tool: 'Bash', input: { command: "python3 - <<'EOF'\nprint('hi')\nEOF" }, text: 'hi there\n' }
+  const src = sourcesFrom(transcript(READ_USE, BASH_USE, many, pdf, script))
+  const block = (body: string, closed = true) => checkQuote({ kind: 'block', body, closed } as any, src)
+  const span = (body: string) => checkQuote({ kind: 'span', body, closed: true } as any, src)
+  expect(block('\nconst TTL = 15 * 60\n  return TTL\n')).toEqual({ ok: true, label: '/p/a.ts:2-3' })
+  expect(span('TTL = 15')).toEqual({ ok: true, label: '/p/a.ts:2' }) // part of a line
+  expect(span('const a = 1')).toEqual({ ok: true, label: '/p/a.ts:1、4' }) // every place in that output
+  expect(span('same')).toEqual({ ok: true, label: '/m:1、2、3 ほか 2 か所' })
+  expect(block('2\tconst TTL = 15 * 60\n3\t  return TTL')).toEqual({ ok: true, label: '/p/a.ts:2-3' }) // copied with Read's numbers
+  expect(block('const TTL = 15 * 60\nreturn TTL')).toEqual({ ok: false, fixable: true, reason: 'どの出力にもない' }) // indentation counts
+  expect(span('system-reminder')).toMatchObject({ ok: false }) // not a line of the file
+  expect(block('  FAIL b\nend')).toEqual({ ok: true, label: 'Bash: npm test…（調べた範囲の 2）' }) // trailing blanks do not count
+  expect(span('hello')).toEqual({ ok: true, label: '/d.pdf' }) // no numbered lines (a PDF): as text, by its path
+  expect(span('hi there')).toEqual({ ok: true, label: "Bash: python3 - <<'EOF'…（調べた範囲の 5）" })
+  expect(span("print('hi')")).toEqual({ ok: true, label: "Bash: python3 - <<'EOF'…（調べた範囲の 5） の入力" }) // what it typed
+  expect(span('/p/a.ts')).toMatchObject({ ok: true, label: 'Read: /p/a.ts の入力' })
+  expect(span('TTL` set')).toEqual({ ok: true, label: '問い' })
+  expect(span('FAIL c')).toEqual({ ok: false, fixable: true, reason: 'どの出力にもない' })
+  expect(block('x', false)).toMatchObject({ ok: false, fixable: true, reason: '閉じるフェンスがない' })
+  expect(block(' \n ')).toEqual({ ok: true }) // nothing to check
+  expect(checkQuote({ kind: 'span', body: 'made up', notQuote: true, closed: true } as any, src)).toEqual({ ok: true, notQuote: true })
+  // what probe cannot read is not the subagent's to mend
+  expect(checkQuote({ kind: 'span', body: 'x', closed: true } as any, null)).toMatchObject({ ok: false, fixable: false, reason: '子の記録を読めなかった' })
+  // a rewrite request after the first answer is not the question; the hand-back is not an output
+  const later = sourcesFrom([...transcript(READ_USE), { role: 'user', text: 'rewrite: zzz', toolUses: [] }, { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'h', tool: 'SubagentHandback', input: { message: 'yyy' }, text: 'ok' }] }])
+  expect(checkQuote({ kind: 'span', body: 'zzz', closed: true } as any, later)).toMatchObject({ ok: false })
+  expect(checkQuote({ kind: 'span', body: 'yyy', closed: true } as any, later)).toMatchObject({ ok: false })
+})
+
+test('the worked answer in the child\'s instructions passes the check it describes', () => {
+  const answer = AGENT_PROMPT.split('答えには次のように書く。\n')[1]
+  const q = quotesOf(answer)
+  const read = { tool_use_id: 'r', tool: 'Read', input: { file_path: '/p/auth.ts' }, text: '12\tconst TTL = 15 * 60\n13\t  return TTL' }
+  const v = q.map((x: any) => checkQuote(x, sourcesFrom(transcript(read))))
+  expect(v).toEqual([{ ok: true, label: '/p/auth.ts:12' }, { ok: true, label: '/p/auth.ts:13' }, { ok: true, notQuote: true }, { ok: true, label: '/p/auth.ts:12-13' }])
+})
+
+test('renderAnswer: matched code as written (a block names its source), the rest marked; 〔〕 is probe\'s alone', () => {
+  const t = ['〔一致〕は偽。`a〔b〕` と `c〔d〕` と `e`（非引用）。', '```', 'f〔g〕', '```', '  ```py', '  h〔i〕', '  ```', '```ts 非引用', 'j', '```', '```', 'k'].join('\n')
+  const q = quotesOf(t)
+  const out = renderAnswer(t, q, [
+    { ok: true, label: '/p/a.ts:2' },
+    { ok: false, fixable: true, reason: 'どの出力にもない' },
+    { ok: true, notQuote: true },
+    { ok: true, label: 'Bash: echo `x`' },
+    { ok: false, fixable: false, reason: 's' },
+    { ok: true, notQuote: true },
+    { ok: false, fixable: true, reason: '閉じるフェンスがない' },
+  ])
+  expect(out).toBe(
+    [
+      '（一致）は偽。`a〔b〕` と `c（d）`〔一致しない：どの出力にもない〕 と `e`〔非引用〕。',
+      "```〔一致：Bash: echo 'x'〕",
+      'f〔g〕',
+      '```',
+      '  ```py 〔確かめられない：s〕',
+      '  h（i）',
+      '  ```',
+      '```ts 〔非引用〕',
+      'j',
+      '```',
+      '```〔一致しない：閉じるフェンスがない〕',
+      'k',
+    ].join('\n'),
+  )
+  expect(renderAnswer('x〔y〕', [], [])).toBe('x（y）')
+  expect(escapeMarks('〔〕')).toBe('（）')
+})
+
+test('a probe subagent\'s tool outputs reach it as they are, with no note after them', async ($, on) => {
+  const w = world($, on, { script: () => ({ answer: 'done', parks: 2 }) })
+  await start($)
+  const got: any[] = []
+  w.onPark.push(async () => {
+    if (got.length > 0 || !w.live.has('agent-1')) return
+    got.push(await asAgent($, 'agent-1', { tool: 'Read', file_path: '/f' }))
+    got.push(await asAgent($, 'agent-1', { tool: 'Edit', file_path: '/f', old_string: 'a', new_string: 'b' }))
+    got.push(await asAgent($, 'agent-1', { tool: CONTEXT }))
+  })
+  await probe($, { questions: ['x'] })
+  expect(got.map((r) => r.context)).toEqual([undefined, undefined, undefined])
+  expect(got[1].deny).toBeDefined()
+})
+
+test('quotes: an answer\'s quotes are checked against the outputs it read; the one that fails is sent back with what failed', async ($, on) => {
+  const w = world($, on, {
+    liveTranscript: true,
+    outputs: { Read: READ_OUT },
+    script: () => ({ answer: '結論。`TTL`\n```\nconst TTL = 30\n```', parks: 2, then: { answer: '結論。`TTL`\n```\nconst TTL = 15 * 60\n```' } }),
+  })
+  await start($)
+  w.onPark.push(async () => {
+    if (w.calls.length === 0 && w.live.has('agent-1')) await asAgent($, 'agent-1', { tool: 'Read', file_path: '/p/a.ts' })
+  })
+  const r = await probe($, { questions: ['x'] })
+  expect(w.sends.length).toBe(1)
+  expect(w.sends[0].text).toContain('  - コードブロック「const TTL = 30」：どの出力にもない')
+  expect(w.sends[0].text).not.toContain('上限')
+  expect(r.result.split('\n\n〔調べた範囲')[0]).toBe('結論。`TTL`\n```〔一致：/p/a.ts:2〕\nconst TTL = 15 * 60\n```')
+})
+
+test('quotes: still failing after the rewrites, or in an answer so far, the quote is marked, not sent back', async ($, on) => {
+  const bad = '```\nnope\n```'
+  const w = world($, on, {
+    liveTranscript: true,
+    outputs: { Read: READ_OUT },
+    script: (p) => (p === 'a' ? { answer: bad, parks: 2, then: { answer: bad, then: { answer: bad } } } : { never: true, wrapup: { answer: bad } }),
+  })
+  await start($)
+  const read = new Set<string>()
+  w.onPark.push(async () => {
+    for (const id of ['agent-1', 'agent-2']) {
+      if (!w.live.has(id) || read.has(id)) continue
+      read.add(id)
+      await asAgent($, id, { tool: 'Read', file_path: '/p/a.ts' })
+    }
+  })
+  const r = await probe($, { questions: ['a', 'b'] })
+  expect(w.sends.filter((s) => String(s.to) === 'agent-1').length).toBe(2) // MAX_REVISIONS
+  expect(w.sends.filter((s) => String(s.to) === 'agent-2').length).toBe(1) // the wrap-up request only
+  const mark = '```〔一致しない：どの出力にもない〕\nnope\n```'
+  const [a, b] = r.result.split('〔問い 2〕')
+  expect(a).toContain(mark)
+  expect(b).toContain(mark)
 })
 
 test('stopSeconds: 5 s before the Bash call\'s own timeout (its timeout, else the default; 10 minutes at most)', () => {
@@ -1690,4 +1930,111 @@ test('a probe hand-back submitted while a turn runs passes to the queue (the att
   expect(running.drop).toBe(undefined)
   expect((await peer($, handback('p1'))).drop).toContain('hand-back')
   expect((await attach($, agentMessage('p1'))).text).toBe(null)
+})
+
+// ---------------------------------------------------------------- savings estimate
+
+const tokens = (input: number, w: number, read: number, out: number, w1h = 0) => ({
+  input_tokens: input, cache_creation_input_tokens: w, cache_read_input_tokens: read, output_tokens: out,
+  cache_creation: { ephemeral_1h_input_tokens: w1h, ephemeral_5m_input_tokens: w - w1h },
+})
+const said = (id: string, u: any, content: any[]) => ({ type: 'assistant', timestamp: '2026-11-05T00:00:00Z', message: { id, role: 'assistant', usage: u, content } })
+const heard = (content: any) => ({ type: 'user', timestamp: '2026-11-05T00:00:00Z', message: { role: 'user', content } })
+// Equal to 12 decimal places (the test framework has no toBeCloseTo).
+const near = (a: number, b: number) => expect(Number(a.toFixed(12))).toBe(Number(b.toFixed(12)))
+const jsonl = (rows: any[]) => rows.map((r) => JSON.stringify(r)).join('\n') + '\n'
+const PROBE_USE = { type: 'tool_use', id: 'toolu_p', name: TOOL, input: { questions: ['q'] } }
+// The main loop: the request that calls probe (its thinking and its call kept as two rows), the result, the next request.
+const PARENT = [
+  heard('調べて'),
+  said('m1', tokens(2, 100, 1000, 50, 100), [{ type: 'thinking', thinking: '' }]),
+  said('m1', tokens(2, 100, 1000, 50, 100), [PROBE_USE]),
+  heard([{ type: 'tool_result', tool_use_id: 'toolu_p', content: 'answer' }]),
+  said('m2', tokens(2, 300, 1100, 10, 300), [{ type: 'text', text: 'done' }]),
+]
+// A subagent: two tool steps, then its answer.
+const CHILD = [
+  heard('q'),
+  said('c1', tokens(1, 500, 0, 20), [{ type: 'tool_use', id: 'b1', name: 'Bash', input: { command: 'ls' } }]),
+  heard([{ type: 'tool_result', tool_use_id: 'b1', content: 'x' }]),
+  said('c2', tokens(1, 300, 500, 40), [{ type: 'tool_use', id: 'b2', name: 'Bash', input: { command: 'pwd' } }]),
+  heard([{ type: 'tool_result', tool_use_id: 'b2', content: 'y' }]),
+  said('c3', tokens(1, 400, 800, 30), [{ type: 'text', text: 'answer' }]),
+]
+
+test('savings: the trial script\'s calculation, step by step', () => {
+  const reqs = requestsOf(PARENT)
+  expect(reqs.map((r: any) => [r.id, r.prompt, r.new, r.tools.length])).toEqual([['m1', 1102, 102, 1], ['m2', 1402, 302, 0]])
+  expect(probeGroupOf(PARENT, 'toolu_p')).toEqual(['toolu_p'])
+  const s: any = savingsOf(PARENT, ['toolu_p'], [CHILD])
+  expect(s.status).toBe('ok')
+  expect([s.C, s.K]).toEqual([1102, 2]) // the answer step is not a tool step
+  near(s.save1a, (1 * 1102 * 0.2) / 1e6) // K-1 more reads of C
+  near(s.save1b, (299 * 0.2) / 1e6) // c3 reads 299 above c1 (c2 reads none)
+  near(s.save2, ((301 + 401) * 8) / 1e6) // the main loop writes at the 1-hour price (all its writes are)
+  near(s.save4, ((20 + 40) * 20) / 1e6) // the subagent's tool steps' output, at Opus prices
+  near(s.add1, (50 * 20) / 1e6)
+  near(s.add2, (72.6 + 62.6 + 73.1) / 1e6) // Haiku: input 0.1, 5-minute write 0.125, read 0.01, output 0.5
+  near(s.add3, (302 * 8) / 1e6)
+  near(s.net, s.save1a + s.save1b + s.save2 + s.save4 - s.add1 - s.add2 - s.add3)
+})
+
+test('savings: another tool in the same request takes its share of the output and of what is written next', () => {
+  const rows = [
+    PARENT[0], PARENT[1],
+    said('m1', tokens(2, 100, 1000, 50, 100), [PROBE_USE, { type: 'tool_use', id: 'toolu_b', name: 'Bash', input: { command: 'ls' } }]),
+    heard([{ type: 'tool_result', tool_use_id: 'toolu_p', content: 'answer' }, { type: 'tool_result', tool_use_id: 'toolu_b', content: 'xxxx' }]),
+    PARENT[4],
+  ]
+  const s: any = savingsOf(rows, ['toolu_p'], [CHILD])
+  // inputs as Python's json.dumps writes them: {"questions": ["q"]} 20 characters, {"command": "ls"} 17
+  near(s.add1, (50 * (20 / 37) * 20) / 1e6)
+  near(s.add3, (302 * 0.6 * 8) / 1e6) // results: 6 characters of 10
+})
+
+test('savings: no line while the request after the result is not written, for an interrupted call, or without subagents', () => {
+  expect(savingsOf(PARENT.slice(0, 4), ['toolu_p'], [CHILD]).status).toBe('pending')
+  const cut = [...PARENT.slice(0, 3), heard([{ type: 'tool_result', tool_use_id: 'toolu_p', content: '[Tool call interrupted: the session ended' }]), PARENT[4]]
+  expect(savingsOf(cut, ['toolu_p'], [CHILD]).status).toBe('interrupted')
+  expect(savingsOf(PARENT, ['toolu_p'], []).status).toBe('no-children')
+  expect(savingsOf(PARENT, ['toolu_x'], [CHILD]).status).toBe('missing')
+  expect(probeGroupOf(PARENT, 'toolu_x')).toBe(undefined)
+  expect(recordRows('{"type":"user"}\n{"type":"assi')).toEqual([{ type: 'user' }]) // a half-written line is left out
+})
+
+test('savingsLine: the saving in dollars, and its share of what the main loop would have paid without probe', () => {
+  const s = { net: 0.8312, save1a: 0.3, save1b: 0.15, save2: 0.3, save4: 0.2, add1: 0.02, add2: 0.03, add3: 0.0688 }
+  expect(savingsLine(s)).toBe('推定節約0.83$(API相当)　未使用時の87%削減') // 0.8312 of 0.95
+  // nothing saved to compare with (no tool step to replay): the dollars alone
+  expect(savingsLine({ net: -0.019, save1a: 0, save1b: 0, save2: 0, save4: 0, add1: 0.011, add2: 0.001, add3: 0.007 })).toBe('推定節約-0.02$(API相当)')
+})
+
+test('savings: after a main-loop probe call, one line once the request after its result is in the transcript', async ($, on) => {
+  const dir = '/home/u/.claude/projects/-p'
+  const files: Record<string, string> = {
+    [`${dir}/S1.jsonl`]: jsonl(PARENT.slice(0, 4)),
+    [`${dir}/S1/subagents/agent-agent-1.jsonl`]: jsonl(CHILD),
+  }
+  const w = world($, on, { files })
+  await start($)
+  await probe($, { questions: ['q'], tool_use_id: 'toolu_p' })
+  const done = () => ($.turn.complete as any)({ turnId: 't', answer: '', durationMs: 1, isAborted: false, reason: 'answer' })
+  await done()
+  expect(w.logs).toEqual([]) // the next request is not in the transcript yet: it waits
+  files[`${dir}/S1.jsonl`] = jsonl(PARENT)
+  await done()
+  expect(w.logs.length).toBe(1)
+  expect(w.logs[0]).toBe(savingsLine(savingsOf(PARENT, ['toolu_p'], [CHILD])))
+  await done()
+  expect(w.logs.length).toBe(1) // once
+})
+
+test('savings: a probe call of a subagent, or one without its id, gets no line', async ($, on) => {
+  const dir = '/home/u/.claude/projects/-p'
+  const w = world($, on, { files: { [`${dir}/S1.jsonl`]: jsonl(PARENT), [`${dir}/S1/subagents/agent-agent-1.jsonl`]: jsonl(CHILD) } })
+  await start($)
+  await probe($, { questions: ['q'], tool_use_id: 'toolu_p', agentId: 'some-subagent' })
+  await probe($, { questions: ['q'] })
+  await ($.turn.complete as any)({ turnId: 't', answer: '', durationMs: 1, isAborted: false, reason: 'answer' })
+  expect(w.logs).toEqual([])
 })

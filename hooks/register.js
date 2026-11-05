@@ -29,8 +29,10 @@
 //                              refused. PROBE_SANDBOX=off (exact) leaves the Bash as it is: for a
 //                              throw-away container that is the isolation.
 //   prompt.submit              drops what a finished probe subagent sends its parent
-//                              (its SubagentHandback report, its task-notification):
-//                              the tool result already carries the answer
+//   prompt.attachment          (its SubagentHandback report, its task-notification):
+//   session.append             the tool result already carries the answer. Delivered into a running
+//                              turn, the row is stored first: session.append cuts it to a stub, and
+//                              prompt.attachment leaves the stub out of the request.
 //   max_chars                  upper bound of each answer (default 2000). The question handed to the
 //                              subagent names it; an answer above it is sent back to the SAME
 //                              subagent (`$.session.send` resumes it; the new answer arrives as
@@ -38,7 +40,14 @@
 //                              Resuming a finished subagent asks `agent.offer` for its type, which
 //                              hides probe:probe: the hook says "offered" while a rewrite is out.
 //                              If the rewrite cannot be had (not delivered, failed, too slow) the
-//                              answer is shortened by `$.model.complete` (no tools), else cut.
+//                              answer is cut. Nothing but the subagent itself writes an answer.
+//   quotes                     the code of an answer (inline spans and fenced blocks) is a quote unless
+//                              the subagent marks it 非引用: each is looked for in what it read (its
+//                              transcript: the outputs as it read them, a Read output by its lines so the
+//                              label names file:lines; what it typed; the question). Code that fails is
+//                              sent back with the length (same rewrite, same limit), else marked. 〔〕 is probe's
+//                              own: in the subagent's text it becomes （）, and every mark probe adds
+//                              (verdicts, the scope list, the cut mark, the question heads) is in 〔〕.
 //   tool.check                 allows the Agent call that starts probe:probe, and the TaskStop that stops
 //                              one, when this plugin raised them (its own $.agent.spawn, TaskStop). Auto mode's server-side classifier gives no
 //                              verdict for an action no model response asked for, and refuses it; the
@@ -77,10 +86,10 @@ const MIN_MAX_CHARS = 500
 const MAX_MAX_CHARS = 8000
 const MAX_REVISIONS = 2
 const REWRITE_TIMEOUT_MS = 3 * 60 * 1000
-const SHORTEN_TIMEOUT_MS = 60 * 1000
 const WRAPUP_TIMEOUT_MS = 2 * 60 * 1000 // a question past its time is asked for what it found so far, and waited for this long
-const SCOPE_MAX_LINES = 15
+const SCOPE_MAX_ENTRIES = 15
 const SCOPE_LINE_CHARS = 80
+const SCOPE_COMMAND_CHARS = 1500 // a Bash command in the scope list, whole (a heredoc's script too) up to this many characters
 const HANDBACK_TOOL = 'SubagentHandback' // how a subagent hands its answer back: neither refused nor listed
 const COMPLETIONS_CAP = 256
 const CHILD_MODEL = 'haiku' // probe always runs on haiku
@@ -115,7 +124,13 @@ export const AGENT_PROMPT = [
   '「## 背景」は参考にする。足りなければ context ツールで依頼主の会話を必要な分だけ読む。',
   `最後のメッセージがそのまま返る。結論を先に、既定では ${DEFAULT_MAX_CHARS} 字以内で書く。依頼の末尾に「結果の上限: N 字」とあれば N 字が上限。長さや形の指定があればそれに従う。前置き・経過・使ったコマンド・注意書きは書かない。`,
   '依頼主は答えを確かめずに使うので、確かめていない推測には「推測」と書く。見つからなかったときは、そう書く。',
+  '読んだ出力から得たこと（コード、設定、ログ、コマンドの結果、識別子、パス）は、言い換えずに原文のままコードで書く。短いものはインラインのコード、複数行はコードブロック。地の文は結論と、原文どうしのつなぎにする。コードの中は出力から一字も変えずに写し、行番号・省略・注釈は入れない。行の一部だけでもよい。途中を省くならブロックを分ける。原文でないコード（自分で組み立てた式、書き換えたコード、修正案）には印を付ける：インラインのコードは直後に（非引用）、コードブロックは開きのフェンスに 非引用（```ts 非引用）。ファイルは Read で読み、その出力を写す。WebSearch と WebFetch から得たことは、この対象外。WebFetch の結果はページの原文ではなく要約なので、地の文で書き、出典の URL を添える。',
   '失敗したことや分からなかったことはそのまま書く。日本語で書く。',
+  // One worked answer: code copied from the output as it is, a line or a part of one, and code of its own marked.
+  '\n\n例：Read の出力が次の2行だったとする。\n',
+  '12\tconst TTL = 15 * 60\n13\t  return TTL\n',
+  '答えには次のように書く。\n',
+  '有効期限は `15 * 60` 秒で、`return TTL` で返している。30 分にするなら `const TTL = 30 * 60`（非引用）。\n```\nconst TTL = 15 * 60\n  return TTL\n```',
 ].join('')
 
 export const AGENT_SPEC = {
@@ -134,7 +149,7 @@ export const TOOL_SPEC = {
     '読み取り専用のシェルで調べて、結論か関係する原文の引用だけを返す。ファイルの検索、コマンドやテストの実行、Web 検索ができ、条件を明示すれば分岐を含む手順も任せられる。' +
     '向くのは、どこにあるか分からないものを広く探すとき、多くのファイルにまたがるとき、長い出力（ログ、コマンドの出力）から要点だけ欲しいとき、Web で調べるとき。これから編集する箇所と、すぐ済む確認は自分でやる。' +
     '判断は、基準を問いに書けるなら任せられる。会話全体の文脈や好みに依る判断は任せず、材料集めに使う。' +
-    '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれる。答えの後ろには、調べた範囲（使ったツールの一覧）が付く。',
+    '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれる。〔〕 は probe が付ける印。答えの中のコード（インラインのコードとコードブロック）は、印がなければツールの出力と照合済みの原文。コードブロックには出どころが 〔一致：…〕 で付く。原文でないと書き手が示したコードには 〔非引用〕、照合できなかったコードには 〔一致しない〕 が付く。WebFetch の出力はページの原文ではなく要約なので、Web の内容は原文と照合されていない。答えの後ろには、調べた範囲（使ったツールの一覧）が付く。',
   inputSchema: {
     type: 'object',
     properties: {
@@ -149,7 +164,7 @@ export const TOOL_SPEC = {
         type: 'integer',
         minimum: MIN_MAX_CHARS,
         maximum: MAX_MAX_CHARS,
-        description: `1件ごとの結果の字数の上限（${MIN_MAX_CHARS}〜${MAX_MAX_CHARS}、省略すると ${DEFAULT_MAX_CHARS}）。引用や一覧が多いときは上げる。超えると短くされるか切り詰められる。`,
+        description: `1件ごとの結果の字数の上限（${MIN_MAX_CHARS}〜${MAX_MAX_CHARS}、省略すると ${DEFAULT_MAX_CHARS}）。引用や一覧が多いときは上げる。超えると書き直させ、それでも超えれば切り詰める。`,
       },
       context: {
         type: 'boolean',
@@ -259,6 +274,20 @@ export function rewriteRequest(n, max) {
   return `結果が ${n} 字で、上限 ${max} 字を超えた。結論を先に、${max} 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。`
 }
 
+/**
+ * What the subagent is asked when its answer is above the bound (`n` characters, else undefined) or has
+ * quotes that fail (`failures`: { head, reason }); with no failures, rewriteRequest.
+ */
+export function reviseRequest(n, max, failures = []) {
+  if (failures.length === 0) return rewriteRequest(n, max)
+  const lines = ['答えを直して。']
+  if (n !== undefined) lines.push(`- 結果が ${n} 字で、上限 ${max} 字を超えた。結論を先に、${max} 字以内にする。必要な情報だけ残す。`)
+  lines.push('- 次のコードは、読んだ出力のどこにもない。出力から一字も変えずに写し直すか、原文でないなら印を付ける（インラインのコードは直後に（非引用）、コードブロックは開きのフェンスに 非引用）。')
+  for (const f of failures) lines.push(`  - ${f.head}：${f.reason}`)
+  lines.push('直した答えの全体だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。')
+  return lines.join('\n')
+}
+
 /** What a subagent past its time is asked for: its answer so far, by the usual rules, with no more lookups. */
 export function wrapupRequest(minutes, max) {
   return `時間切れ（${minutes} 分）。これ以上は調べない（道具は断られる）。ここまでで分かったことを、ふつうの答えと同じ決まりで、結論を先に ${max} 字以内で書く。時間内に調べきれなかったことは、分からなかったこととして書く。書いた答えだけを最後のメッセージに書く。`
@@ -266,13 +295,13 @@ export function wrapupRequest(minutes, max) {
 
 export const WRAPUP_DENY = 'probe の時間切れのため、道具は使えない。ここまでで分かったことを答えとして書き、最後のメッセージにする。'
 
-/** One line of the scope list for a tool call of a subagent (`e` as tool.call has it). */
-export function callLine(e) {
+/** What a tool call of a subagent did (`e` as tool.call has it), as `Tool: what`: a Bash command whole, all its lines. */
+function callWhat(e) {
   const str = (k) => (typeof e[k] === 'string' ? e[k] : '')
   let what
   switch (e.tool) {
     case 'Bash':
-      what = str('command').trim().split('\n')[0]
+      what = str('command').trim()
       break
     case 'Read': {
       const from = typeof e.offset === 'number' ? e.offset : 1
@@ -296,9 +325,32 @@ export function callLine(e) {
       what = JSON.stringify(input)
     }
   }
-  const line = `${e.tool}: ${what}`
-  const chars = Array.from(line)
-  return chars.length <= SCOPE_LINE_CHARS ? line : chars.slice(0, SCOPE_LINE_CHARS - 1).join('') + '…'
+  return `${e.tool}: ${what}`
+}
+
+/** `text` when it has at most `max` characters, else its first `max - 1` and `…`. */
+function clip(text, max) {
+  const chars = Array.from(text)
+  return chars.length <= max ? text : chars.slice(0, max - 1).join('') + '…'
+}
+
+/**
+ * A tool call of a subagent as the scope list shows it, its 〔〕 turned into （） (a command could forge
+ * probe's marks): a Bash command whole, all its lines (a heredoc's script too), up to SCOPE_COMMAND_CHARS
+ * characters and the rest marked; any other call in one line of at most SCOPE_LINE_CHARS.
+ */
+export function callLine(e) {
+  const what = escapeMarks(callWhat(e))
+  if (e.tool !== 'Bash') return clip(what, SCOPE_LINE_CHARS)
+  const chars = Array.from(what)
+  if (chars.length <= SCOPE_COMMAND_CHARS) return what
+  return chars.slice(0, SCOPE_COMMAND_CHARS).join('') + `\n〔以下 ${chars.length - SCOPE_COMMAND_CHARS} 字略〕`
+}
+
+/** How a quote names the call it is from: the first line of its scope line, at most SCOPE_LINE_CHARS, `…` where cut. */
+export function callHead(e) {
+  const [first, ...more] = callLine(e).split('\n')
+  return clip(more.length > 0 ? first + '…' : first, SCOPE_LINE_CHARS)
 }
 
 /** Whether `e` (a tool call) comes from a probe subagent past its time, and is not the hand-back. */
@@ -307,22 +359,29 @@ function wrappingUp(e) {
 }
 
 /**
- * The scope list of a subagent, from its transcript: each tool call as the model wrote it (before the
- * sandbox wrapped it), marked when it ended in an error; not the hand-back, nor what the wrap-up refused.
+ * The tool calls of a subagent's transcript that the scope list shows, in order: each as the model wrote it
+ * (before the sandbox wrapped it), as its scope line (callLine; its first line marked when the call ended in
+ * an error), with its id. Not the hand-back, nor what the wrap-up refused.
  */
+function scopeCalls(messages) {
+  const calls = []
+  for (const m of messages) {
+    for (const u of (m && m.toolUses) || []) {
+      if (!u || u.tool === HANDBACK_TOOL || u.text === WRAPUP_DENY) continue
+      const input = u.input && typeof u.input === 'object' ? u.input : {}
+      const [first, ...more] = callLine({ ...input, tool: u.tool }).split('\n')
+      calls.push({ id: u.tool_use_id, line: [first + (u.isError ? '（エラー）' : ''), ...more].join('\n') })
+    }
+  }
+  return calls
+}
+
+/** The scope list of a subagent, from its transcript (scopeCalls). */
 async function scopeOf($, agentId) {
   try {
     const messages = await $.session.messages({ agentId })
     if (!Array.isArray(messages)) return SCOPE_UNREAD
-    const lines = []
-    for (const m of messages) {
-      for (const u of (m && m.toolUses) || []) {
-        if (!u || u.tool === HANDBACK_TOOL || u.text === WRAPUP_DENY) continue
-        const input = u.input && typeof u.input === 'object' ? u.input : {}
-        lines.push(callLine({ ...input, tool: u.tool }) + (u.isError ? '（エラー）' : ''))
-      }
-    }
-    return scopeText(lines)
+    return scopeText(scopeCalls(messages).map((c) => c.line))
   } catch {
     return SCOPE_UNREAD
   }
@@ -330,52 +389,316 @@ async function scopeOf($, agentId) {
 
 /**
  * The scope list after an answer, always there (an answer could claim lookups it never made): the
- * subagent's tool calls, each distinct one once with how many times it ran, at most SCOPE_MAX_LINES.
+ * subagent's tool calls, each distinct one once (the same whole line), numbered in the order they first
+ * ran (a quote names its source by that number: sourcesOf), with how many times it ran; the further lines
+ * of a call (a Bash script) indented under it. At most SCOPE_MAX_ENTRIES.
  */
 export function scopeText(lines) {
   const all = lines || []
-  if (all.length === 0) return '調べた範囲（呼び出し 0 回）：ツールは使っていない。'
+  if (all.length === 0) return '〔調べた範囲（呼び出し 0 回）：ツールは使っていない〕'
   const counts = new Map()
   for (const l of all) counts.set(l, (counts.get(l) || 0) + 1)
   const entries = [...counts]
-  const line = ([l, n]) => `- ${l}${n > 1 ? `（${n}回）` : ''}`
-  const shown = entries.slice(0, SCOPE_MAX_LINES).map(line)
-  const rest = entries.slice(SCOPE_MAX_LINES)
-  if (rest.length > 0) shown.push(`- ほか ${rest.length} 種類（${rest.reduce((a, [, n]) => a + n, 0)}回）`)
-  return `調べた範囲（呼び出し ${all.length} 回）：\n${shown.join('\n')}`
+  const entry = ([l, n], i) => {
+    const [first, ...more] = l.split('\n')
+    const pad = ' '.repeat(`${i + 1}. `.length)
+    return [`${i + 1}. ${first}${n > 1 ? `（${n}回）` : ''}`, ...more.map((m) => (m ? pad + m : m))].join('\n')
+  }
+  const shown = entries.slice(0, SCOPE_MAX_ENTRIES).map(entry)
+  const rest = entries.slice(SCOPE_MAX_ENTRIES)
+  if (rest.length > 0) shown.push(`ほか ${rest.length} 種類（${rest.reduce((a, [, n]) => a + n, 0)}回）`)
+  return `〔調べた範囲（呼び出し ${all.length} 回）〕\n${shown.join('\n')}`
 }
 
-export const SCOPE_UNREAD = '調べた範囲：子の記録を読めなかった。'
+export const SCOPE_UNREAD = '〔調べた範囲：子の記録を読めなかった〕'
 
 /** The text itself when it fits in `max` characters, else its first `max` characters and a mark. */
 function fit(text, max, why) {
   const chars = Array.from(String(text))
   if (chars.length <= max) return String(text)
-  return chars.slice(0, max).join('') + `\n…(切り詰め。元は ${chars.length} 文字${why ? '。' + why : ''})`
+  return chars.slice(0, max).join('') + `\n〔切り詰め：元は ${chars.length} 字${why ? '。' + why : ''}〕`
 }
 
 /**
- * One result: its text alone, no heading. Two or more: `## 1`, `## 2` ... one section per question, in
- * question order. No file path lines. An answer above `maxChars` is cut (marked).
+ * One result: its text alone, no heading. Two or more: `〔問い 1〕`, `〔問い 2〕` ... one section per
+ * question, in question order. No file path lines. An answer above `maxChars` is cut (marked).
  */
 export function formatResults(results, maxChars = DEFAULT_MAX_CHARS) {
-  const body = (r) => fit(r ? r.text : 'ERROR: 結果なし', maxChars, r && r.why) + (r && r.note ? '\n' + r.note : '') + (r && r.scope ? '\n\n' + r.scope : '')
+  const body = (r) => fit(r ? r.text : 'ERROR: 結果なし', maxChars, r && r.why) + (r && r.scope ? '\n\n' + r.scope : '')
   if (results.length === 1) return body(results[0])
-  return results.map((r, i) => `## ${i + 1}\n${body(r)}`).join('\n\n')
+  return results.map((r, i) => `〔問い ${i + 1}〕\n${body(r)}`).join('\n\n')
 }
 
-/** The request for `$.model.complete` that shortens an answer which is `n` characters long to `max`. */
-export function shortenPrompt(question, answer, n, max) {
-  return [
-    `次は調べものの依頼と、その答えである。答えが長すぎるので、${max} 字以内に書き直す。`,
-    '結論を先に書く。数値・名前・ファイル:行・原文の引用など必要な情報だけ残し、経過・前置き・注意書きは削る。答えにないことは書かない。日本語で、書き直した結果だけを返す。',
-    '',
-    '【依頼】',
-    question,
-    '',
-    `【答え（${n} 字）】`,
-    answer,
-  ].join('\n')
+// ---------------------------------------------------------------- quotes
+
+const FENCE_OPEN = /^([ \t]*)(`{3,}|~{3,})(.*)$/
+const NOT_QUOTE = '非引用'
+const NOT_QUOTE_AFTER = /^ ?[（(]非引用(?:[、,，：:][^）)\n]*)?[）)]/ // （非引用）, （非引用、why）, one space before
+const READ_LINE = /^\s*(\d+)(?:\t|→)(.*)$/
+const MAX_PLACES = 3
+const MAX_FAILURES_SHOWN = 10 // the failed code a rewrite request lists
+
+/** The subagent's own text, with probe's brackets 〔〕 turned into （） so that no mark of probe can be written by it. */
+export function escapeMarks(text) {
+  return String(text).replace(/〔/g, '（').replace(/〕/g, '）')
+}
+
+/**
+ * The code of an answer, in order: every fenced block and every inline code span, each taken for a quote
+ * of what the subagent read unless it says it is not one (`notQuote`): a block by 非引用 in its info
+ * string, a span by （非引用） right after it. Fences as Markdown reads them: a block ends at a line of its
+ * fence's character, at least as long, and nothing else (`closed: false` when none: it runs to the end),
+ * so a longer fence holds a shorter one. A span (spansOf) is on one line outside the blocks.
+ * `start`/`end` bound each, a block's fence lines and a span's （非引用） included.
+ * A block: `raw` its content as written, `body` the same with the opening fence's indentation (a block in
+ * a list) taken off each line, `lang` its info string but 非引用, `indent`/`fence`/`close` what rendering keeps.
+ */
+export function quotesOf(text) {
+  const s = String(text)
+  const lines = s.split('\n')
+  const at = []
+  for (let i = 0, p = 0; i < lines.length; i++) {
+    at.push(p)
+    p += lines[i].length + 1
+  }
+  const quotes = []
+  for (let i = 0; i < lines.length; i++) {
+    const m = FENCE_OPEN.exec(lines[i].replace(/\r$/, ''))
+    if (!m || (m[2][0] === '`' && m[3].includes('`'))) {
+      quotes.push(...spansOf(lines[i], at[i]))
+      continue
+    }
+    const [, indent, fence, info] = m
+    const closes = (l) => {
+      const t = l.trim()
+      return t.length >= fence.length && t === fence[0].repeat(t.length)
+    }
+    let j = i + 1
+    while (j < lines.length && !closes(lines[j])) j++
+    const closed = j < lines.length
+    const tokens = info.trim().split(/\s+/).filter(Boolean)
+    const content = lines.slice(i + 1, j)
+    const dedent = (l) => {
+      let n = 0
+      while (n < indent.length && (l[n] === ' ' || l[n] === '\t')) n++
+      return l.slice(n)
+    }
+    quotes.push({
+      kind: 'block',
+      start: at[i],
+      end: closed ? at[j] + lines[j].length : s.length,
+      notQuote: tokens.includes(NOT_QUOTE),
+      lang: tokens.filter((t) => t !== NOT_QUOTE).join(' '),
+      indent,
+      fence,
+      raw: content.length > 0 ? content.join('\n') : undefined,
+      body: content.map(dedent).join('\n'),
+      close: closed ? lines[j] : undefined,
+      closed,
+    })
+    i = closed ? j : lines.length
+  }
+  return quotes
+}
+
+/**
+ * The inline code spans of one line outside the blocks, at `offset` in the answer, as Markdown reads them:
+ * a run of backticks up to the next run of the same length (a run with none is text). `ticks` its
+ * backticks, `raw` what is between them, `body` the same less one space at each end when both have one.
+ */
+function spansOf(line, offset) {
+  const spans = []
+  const runs = [...line.matchAll(/`+/g)]
+  for (let a = 0; a < runs.length; a++) {
+    const open = runs[a]
+    const b = runs.findIndex((r, x) => x > a && r[0].length === open[0].length)
+    if (b < 0) continue
+    const close = runs[b]
+    const raw = line.slice(open.index + open[0].length, close.index)
+    const strip = raw.length >= 2 && raw.startsWith(' ') && raw.endsWith(' ') && raw.trim() !== ''
+    let end = close.index + close[0].length
+    const after = NOT_QUOTE_AFTER.exec(line.slice(end))
+    if (after) end += after[0].length
+    spans.push({ kind: 'span', start: offset + open.index, end: offset + end, notQuote: after !== null, ticks: open[0], raw, body: strip ? raw.slice(1, -1) : raw, closed: true })
+    a = b
+  }
+  return spans
+}
+
+/** Text compared line by line without what ends a line (CR, trailing blanks). */
+function plain(text) {
+  return String(text)
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((l) => l.replace(/[ \t]+$/, ''))
+    .join('\n')
+}
+
+/** The numbered lines of a Read output (`12\tcode`), or null when it has none (a PDF, an image). */
+function readLines(text) {
+  const lines = []
+  for (const l of String(text).replace(/\r\n?/g, '\n').split('\n')) {
+    const m = READ_LINE.exec(l)
+    if (m) lines.push({ no: Number(m[1]), text: m[2].replace(/[ \t]+$/, '') })
+  }
+  return lines.length > 0 ? lines : null
+}
+
+/** Every place `needle` starts in `hay`. */
+function placesOf(hay, needle) {
+  const at = []
+  for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + 1)) at.push(i)
+  return at
+}
+
+/** Line ranges (`12-13`, `40`) of the places a quote of `size` characters was found in the joined Read lines. */
+function rangesOf(lines, places, size) {
+  const starts = []
+  let pos = 0
+  for (const l of lines) {
+    starts.push(pos)
+    pos += l.text.length + 1
+  }
+  const lineAt = (offset) => {
+    let i = 0
+    while (i + 1 < starts.length && starts[i + 1] <= offset) i++
+    return lines[i].no
+  }
+  return places.map((p) => {
+    const a = lineAt(p)
+    const b = lineAt(p + Math.max(0, size - 1))
+    return a === b ? `${a}` : `${a}-${b}`
+  })
+}
+
+/**
+ * How a quote names an output other than a file's: the call's first line (callHead), and, when that is not
+ * the whole call (a script, a long command), the call's number in the scope list (`entry`) where it is whole.
+ */
+function sourceLabel(e, entry) {
+  const head = callHead(e)
+  return head === callLine(e) || entry === undefined ? head : `${head}（調べた範囲の ${entry}）`
+}
+
+/**
+ * What a subagent read, from its transcript: `outputs`, its tool calls' outputs as it read them ({ tool,
+ * input, text, entry }; entry: the call's number in the scope list); `inputs`, each string it typed into a
+ * call (a command, a path, a pattern; same shape); `question`, the user messages before its first answer
+ * (a rewrite request is not one). Not the hand-back, nor what the wrap-up refused.
+ */
+export function sourcesFrom(messages) {
+  const entryOf = new Map()
+  const entries = new Map()
+  for (const c of scopeCalls(messages)) {
+    if (!entries.has(c.line)) entries.set(c.line, entries.size + 1)
+    entryOf.set(c.id, entries.get(c.line))
+  }
+  const outputs = []
+  const inputs = []
+  const asked = []
+  let answered = false
+  for (const m of messages) {
+    if (!m) continue
+    if (m.role === 'assistant') answered = true
+    if (m.role === 'user' && !answered && typeof m.text === 'string') asked.push(m.text)
+    for (const u of m.toolUses || []) {
+      if (!u || u.tool === HANDBACK_TOOL || u.text === WRAPUP_DENY) continue
+      const input = u.input && typeof u.input === 'object' ? u.input : {}
+      const entry = entryOf.get(u.tool_use_id)
+      if (typeof u.text === 'string') outputs.push({ tool: u.tool, input, text: u.text, entry })
+      for (const v of Object.values(input)) if (typeof v === 'string' && v !== '') inputs.push({ tool: u.tool, input, text: v, entry })
+    }
+  }
+  return { outputs, inputs, question: asked.join('\n') }
+}
+
+/**
+ * The verdict on one piece of code (quotesOf) against what the subagent read (sourcesFrom; null when its
+ * transcript could not be read). Code said not to be a quote is not checked; empty code passes. Otherwise
+ * it is looked for in a file's lines first (Read, by its lines without their numbers: the label names
+ * file:lines), then in any output as text, what the subagent typed, the question.
+ * -> { ok: true, label?, notQuote? } | { ok: false, fixable, reason } (fixable: the subagent can mend it).
+ */
+export function checkQuote(q, sources) {
+  if (q.notQuote) return { ok: true, notQuote: true }
+  if (!q.closed) return { ok: false, fixable: true, reason: '閉じるフェンスがない' }
+  const body = plain(q.body).replace(/^\n+/, '').replace(/\n+$/, '')
+  if (!body.trim()) return { ok: true }
+  if (sources === null) return { ok: false, fixable: false, reason: '子の記録を読めなかった' }
+  const lines = body.split('\n')
+  const needles = [body.trim()]
+  if (lines.every((l) => READ_LINE.test(l))) needles.push(lines.map((l) => READ_LINE.exec(l)[2]).join('\n').trim()) // copied with Read's numbers
+  for (const src of sources.outputs) {
+    const read = src.tool === 'Read' ? readLines(src.text) : null
+    if (!read) continue
+    const path = typeof src.input.file_path === 'string' ? src.input.file_path : ''
+    const hay = read.map((l) => l.text).join('\n')
+    for (const needle of needles) {
+      const places = placesOf(hay, needle)
+      if (places.length === 0) continue
+      const ranges = rangesOf(read, places.slice(0, MAX_PLACES), needle.length)
+      const more = places.length > MAX_PLACES ? ` ほか ${places.length - MAX_PLACES} か所` : ''
+      return { ok: true, label: `${path}:${ranges.join('、')}${more}` }
+    }
+  }
+  const needle = needles[0]
+  for (const src of sources.outputs) {
+    if (src.tool === 'Read' && readLines(src.text)) continue
+    if (!plain(src.text).includes(needle)) continue
+    return { ok: true, label: src.tool === 'Read' ? String(src.input.file_path ?? '') : sourceLabel({ ...src.input, tool: src.tool }, src.entry) }
+  }
+  for (const src of sources.inputs) {
+    if (plain(src.text).includes(needle)) return { ok: true, label: `${sourceLabel({ ...src.input, tool: src.tool }, src.entry)} の入力` }
+  }
+  if (plain(sources.question).includes(needle)) return { ok: true, label: '問い' }
+  return { ok: false, fixable: true, reason: 'どの出力にもない' }
+}
+
+/**
+ * The answer as the caller gets it: the subagent's text with 〔〕 turned into （）, its code with probe's
+ * verdict. Code that matched stays as written (it is the output's own text): a span with no mark, a block
+ * with 〔一致：source〕 in its info string. Code said not to be a quote gets 〔非引用〕 (in place of the
+ * subagent's （非引用）), code that failed 〔一致しない：…〕 or 〔確かめられない：…〕.
+ */
+export function renderAnswer(text, quotes, verdicts) {
+  const s = String(text)
+  let out = ''
+  let at = 0
+  quotes.forEach((q, i) => {
+    out += escapeMarks(s.slice(at, q.start)) + (q.kind === 'block' ? renderBlock(q, verdicts[i]) : renderSpan(q, verdicts[i]))
+    at = q.end
+  })
+  return out + escapeMarks(s.slice(at))
+}
+
+/** probe's mark for a verdict ('' for code that matched with no source to name). */
+function markOf(v) {
+  if (v.notQuote) return '〔非引用〕'
+  if (v.ok) return v.label !== undefined ? `〔一致：${escapeMarks(v.label)}〕` : ''
+  return v.fixable ? `〔一致しない：${v.reason}〕` : `〔確かめられない：${v.reason}〕`
+}
+
+function renderBlock(q, v) {
+  const asIs = v.ok && !v.notQuote
+  // the info string of a backtick fence holds no backtick (else Markdown reads no fence)
+  const info = [escapeMarks(q.lang), markOf(v)].filter(Boolean).join(' ').replace(/`/g, "'")
+  const parts = [`${q.indent}${q.fence}${info}`]
+  if (q.raw !== undefined) parts.push(asIs ? q.raw : escapeMarks(q.raw))
+  if (q.closed) parts.push(q.close)
+  return parts.join('\n')
+}
+
+function renderSpan(q, v) {
+  if (v.ok && !v.notQuote) return `${q.ticks}${q.raw}${q.ticks}`
+  return `${q.ticks}${escapeMarks(q.raw)}${q.ticks}${markOf(v)}`
+}
+
+/** How failed code is named in the request to mend it: the start of its first line. */
+function quoteHead(q) {
+  const first = plain(q.body).trim().split('\n')[0] || ''
+  const chars = Array.from(first)
+  const shown = chars.length > 40 ? chars.slice(0, 40).join('') + '…' : first
+  return q.kind === 'block' ? `コードブロック「${shown}」` : `「${shown}」`
 }
 
 const SYSTEM_REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g
@@ -469,6 +792,23 @@ export function outcomeOf(c) {
 
 const HANDBACK_MARK = '[Subagent hand-back]'
 const HANDBACK_STUB = 'probe: probe の hand-back（内容は tool の結果に含まれている）'
+const NOTIFICATION_STUB = 'probe: probe の完了通知（内容は tool の結果に含まれている）'
+
+// The engine's note on a delivery of the tools its sender used that the conversation has not been told
+// of (a probe's are in the answer's scope too). Wrapped in a reminder in the stored row; prompt.attachment
+// gets the text with that wrapper taken off, as the engine puts its own around the whole.
+const TOOLS_USED = /<tools-used-before-summary>[\s\S]*?<\/tools-used-before-summary>/g
+
+/**
+ * Is `text`, its `<system-reminder>` blocks and tools-used notes aside, nothing but the stubs cutRow
+ * leaves? A request carries a row as stored, so prompt.attachment sees a delivery cut at session.append
+ * as its stub. A message the person sends into a running turn comes under the engine's line saying so:
+ * a stub quoted in it is no stub here.
+ */
+export function onlyStubs(text) {
+  const lines = bodyOf(String(text ?? '').replace(TOOLS_USED, '')).split('\n').map((l) => l.trim()).filter((l) => l !== '')
+  return lines.length > 0 && lines.every((l) => l === HANDBACK_STUB || l === NOTIFICATION_STUB)
+}
 
 const MESSAGE_TAG = /<(?:cross-session-message|agent-message)\b/
 
@@ -503,6 +843,16 @@ export function taskIdsOf(text) {
   let m
   while ((m = re.exec(String(text))) !== null) ids.push(m[1])
   return ids
+}
+
+/** Is `text` a notification of probe subagents only (it names task ids, every one a probe subagent's)? */
+async function probeNotification($, text) {
+  const ids = taskIdsOf(text)
+  if (ids.length === 0) return false
+  for (const id of ids) {
+    if (!(await isProbeAgent($, id))) return false
+  }
+  return true
 }
 
 /** The reason a context call's input is refused, or undefined. */
@@ -610,17 +960,23 @@ async function isProbeAgent($, agentId) {
 // Debugging aid, off by default: while PROBE_TRACE names a file, every delivery that looks like
 // an agent message is summarised, as each hook sees it, into that file (see docs/design.md).
 
+const TRACE_KEY = 'trace'
+const TRACED = [MESSAGE_TAG, HANDBACK_MARK, '<task-notification>', 'probe: probe の', 'tools-used-before-summary']
+
 function textOfEvent(e) {
   if (typeof e.text === 'string') return e.text
   const content = e.message && Array.isArray(e.message.content) ? e.message.content : []
   return content.map((b) => (b && b.type === 'text' && typeof b.text === 'string' ? b.text : '')).join('\n')
 }
 
-/** One line of JSON appended to the file PROBE_TRACE names, when it is set. */
+/**
+ * One line of JSON appended to the file PROBE_TRACE names, or else the store's `trace` key (a running
+ * session takes no new environment; the store it reads again on each call), when one is set.
+ */
 async function traceLine($, entry) {
   try {
-    const log = await $.env.get('PROBE_TRACE')
-    if (!log) return
+    const log = (await $.env.get('PROBE_TRACE')) || (await $.store.get(TRACE_KEY))
+    if (typeof log !== 'string' || log === '') return
     await $.process.run(['sh', '-c', 'cat >> "$1"', 'sh', log], { stdin: JSON.stringify(entry) + '\n', timeoutMs: 5000 })
   } catch {}
 }
@@ -628,7 +984,7 @@ async function traceLine($, entry) {
 async function trace($, hook, e, note) {
   try {
     const text = textOfEvent(e)
-    if (!MESSAGE_TAG.test(text) && !text.includes(HANDBACK_MARK)) return
+    if (!TRACED.some((t) => (typeof t === 'string' ? text.includes(t) : t.test(text)))) return
     await traceLine($, {
       hook, note, type: e.type, door: e.door, name: e.message && e.message.name, origin: e.origin, agentId: e.agentId,
       turnId: e.turnId, length: text.length, text: text.slice(0, 2000),
@@ -636,14 +992,23 @@ async function trace($, hook, e, note) {
   } catch {}
 }
 
-/** Rewrites a conversation row that holds a probe subagent's hand-back to a one-line stub. */
+/**
+ * Rewrites a conversation row that holds what a probe subagent sent its parent to a one-line stub: its
+ * hand-back, or its task-notification (only in a row the engine marks as one: the person's own message,
+ * a reminder like it, may quote a notification).
+ */
 async function cutRow($, e, next) {
   const content = []
   let changed = false
+  const notice = e.origin !== undefined && e.origin !== null && e.origin.kind === 'task-notification'
   for (const b of e.message.content) {
-    const senders = b.type === 'text' && typeof b.text === 'string' ? handbackSendersOf(b.text) : undefined
-    if (senders !== undefined && (await allProbeSenders($, senders))) {
-      content.push({ ...b, text: HANDBACK_STUB })
+    const text = b.type === 'text' && typeof b.text === 'string' ? b.text : undefined
+    const senders = text !== undefined ? handbackSendersOf(text) : undefined
+    let stub
+    if (senders !== undefined && (await allProbeSenders($, senders))) stub = HANDBACK_STUB
+    else if (notice && text !== undefined && (await probeNotification($, text))) stub = NOTIFICATION_STUB
+    if (stub !== undefined) {
+      content.push({ ...b, text: stub })
       changed = true
     } else {
       content.push(b)
@@ -708,8 +1073,8 @@ async function stopAgent($, agentId) {
  * open from here on; it stays open when the request was delivered (the caller closes it with
  * closeWindow when the rewrite is over) and shuts at once when not. The outcome goes to the trace.
  */
-async function askRewrite($, agentId, n, max) {
-  return askAgain($, agentId, rewriteRequest(n, max), { hook: 'rewrite', length: n, max })
+async function askRewrite($, agentId, n, max, failures = []) {
+  return askAgain($, agentId, reviseRequest(n, max, failures), { hook: 'rewrite', length: n, max, quotes: failures.length })
 }
 
 /** Asks the (still running) subagent past its time for its answer so far; whether it was delivered. */
@@ -741,29 +1106,36 @@ function closeWindow(r) {
   }
 }
 
-/**
- * The answer of `r` shortened to `max` characters by one tool-less completion, as a result; when that
- * is not had (no reply, still too long) the answer itself, which formatResults cuts.
- */
-async function shortened($, question, r, max, model, signal) {
-  const n = lengthOf(r.text)
-  let reason = 'no reply'
+/** What subagent `agentId` read (sourcesFrom), from its transcript; null when it cannot be read. */
+async function sourcesOf($, agentId) {
+  let messages
   try {
-    const res = await $.model.complete(
-      { model, prompt: shortenPrompt(question, r.text, n, max), maxTokens: Math.min(64000, Math.max(1024, max * 2)), effort: 'low', timeoutMs: SHORTEN_TIMEOUT_MS },
-      signal ? { signal } : undefined,
-    )
-    const text = res.isAnswered ? res.text.trim() : ''
-    if (text && lengthOf(text) <= max) {
-      await traceLine($, { hook: 'shorten', ok: true, length: n, to: lengthOf(text), max })
-      return { ok: true, text, note: `…(要約。元は ${n} 文字)` }
-    }
-    reason = res.isAnswered ? `still ${lengthOf(text)} chars` : res.reason
-  } catch (err) {
-    reason = `threw: ${err}`
+    messages = await $.session.messages({ agentId })
+  } catch {
+    return null
   }
-  await traceLine($, { hook: 'shorten', ok: false, reason, length: n, max })
-  return { ok: true, text: r.text, ...(r.why ? { why: r.why } : {}) }
+  return Array.isArray(messages) ? sourcesFrom(messages) : null
+}
+
+/**
+ * An answer of subagent `agentId` checked: `text` as the caller gets it (renderAnswer) and the code that
+ * failed in a way the subagent can mend ({ head, reason }, each distinct one once, at most MAX_FAILURES_SHOWN
+ * and a count of the rest). The verdicts go to the trace.
+ */
+async function checkAnswer($, agentId, answer) {
+  const quotes = quotesOf(answer)
+  const sources = quotes.some((q) => !q.notQuote) ? await sourcesOf($, agentId) : { outputs: [], inputs: [], question: '' }
+  const verdicts = quotes.map((q) => checkQuote(q, sources))
+  const heads = new Map()
+  verdicts.forEach((v, i) => {
+    if (!v.ok && v.fixable) heads.set(quoteHead(quotes[i]), v.reason)
+  })
+  const failures = [...heads].slice(0, MAX_FAILURES_SHOWN).map(([head, reason]) => ({ head, reason }))
+  if (heads.size > MAX_FAILURES_SHOWN) failures.push({ head: `ほか ${heads.size - MAX_FAILURES_SHOWN} 個`, reason: '同じく' })
+  if (quotes.length > 0) {
+    await traceLine($, { hook: 'quotes', agentId, total: quotes.length, ok: verdicts.filter((v) => v.ok && !v.notQuote).length, notQuote: verdicts.filter((v) => v.notQuote).length, failed: verdicts.filter((v) => !v.ok).map((v) => v.reason) })
+  }
+  return { text: renderAnswer(answer, quotes, verdicts), failures }
 }
 
 // ---------------------------------------------------------------- the usage rules
@@ -901,32 +1273,30 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
           completions.delete(id)
           closeWindow(r)
           const out = outcomeOf(c)
-          if (out.ok) r.last = out.text
-          if (r.wrapping) {
+          if (!out.ok) {
             running.delete(id)
-            results[r.index] = out.ok && lengthOf(out.text) > maxChars ? { ok: true, text: out.text, shorten: true } : out
+            // A rewrite that failed (error, empty answer) leaves the last good answer (cut when too long).
+            results[r.index] = r.last !== undefined ? { ok: true, text: r.last } : out
             continue
           }
-          // Above the bound: ask the same subagent for a shorter one (its next turn.complete is the
-          // new answer; the entry stays in `running`, the deadline stays the spawn's at most).
-          if (out.ok && r.revisions < MAX_REVISIONS) {
-            const n = lengthOf(out.text)
-            if (n > maxChars) {
-              if (await askRewrite($, id, n, maxChars)) {
-                r.revisions++
-                r.rewriting = true
-                r.deadline = Math.min(r.hardDeadline, (await $.clock.now()) + REWRITE_TIMEOUT_MS)
-              } else {
-                // the rewrite cannot be asked for: shorten the answer here
-                running.delete(id)
-                results[r.index] = { ok: true, text: out.text, shorten: true }
-              }
+          const checked = await checkAnswer($, id, out.text)
+          r.last = checked.text
+          const n = lengthOf(checked.text)
+          const over = n > maxChars
+          // Above the bound, or a quote that fails: ask the same subagent to mend it (its next turn.complete
+          // is the new answer; the entry stays in `running`, the deadline stays the spawn's at most). Not the
+          // answer so far of one past its time, nor past MAX_REVISIONS, nor when the request cannot be
+          // delivered: that answer is taken as it is (cut when too long, failed quotes marked).
+          if (!r.wrapping && r.revisions < MAX_REVISIONS && (over || checked.failures.length > 0)) {
+            if (await askRewrite($, id, over ? n : undefined, maxChars, checked.failures)) {
+              r.revisions++
+              r.rewriting = true
+              r.deadline = Math.min(r.hardDeadline, (await $.clock.now()) + REWRITE_TIMEOUT_MS)
               continue
             }
           }
           running.delete(id)
-          // A rewrite that failed (error, empty answer) leaves the last good answer, to be shortened here.
-          results[r.index] = !out.ok && r.last !== undefined ? { ok: true, text: r.last, shorten: true } : out
+          results[r.index] = { ok: true, text: checked.text }
         } else if (now >= r.deadline) {
           // Past its time with no answer yet: ask for what it found so far (tools refused from here on), once.
           if (!r.wrapping && r.last === undefined && !r.rewriting && (await askWrapup($, id, minutes, maxChars))) {
@@ -945,7 +1315,6 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
               ? {
                   ok: true,
                   text: r.last,
-                  shorten: true,
                   why: now >= r.hardDeadline ? `書き直し中に ${minutes} 分でタイムアウト` : `書き直しが ${REWRITE_TIMEOUT_MS / 60000} 分で終わらなかった`,
                 }
               : { ok: false, text: `ERROR: タイムアウト（${minutes} 分）。${r.wrapping ? `途中までの答えも ${WRAPUP_TIMEOUT_MS / 60000} 分で返らなかった。` : ''}処理を${stopped ? '停止した' : '停止できなかった'}。` }
@@ -976,6 +1345,10 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
         childCalls.set(res.agentId, { effort: e.effort, context: e.context !== false, run, wrapping: false })
         agentOf[index] = res.agentId
         while (childCalls.size > REQUESTERS_CAP) childCalls.delete(childCalls.keys().next().value)
+        if (e.agentId === undefined && typeof e.tool_use_id === 'string') {
+          callChildren.set(e.tool_use_id, [...(callChildren.get(e.tool_use_id) ?? []), res.agentId])
+          while (callChildren.size > SAVINGS_CAP) callChildren.delete(callChildren.keys().next().value)
+        }
         await rememberName($, res.agentId)
         const deadline = (await $.clock.now()) + timeoutMs
         running.set(res.agentId, { index, deadline, hardDeadline: deadline, revisions: 0, last: undefined, rewriting: false, wrapping: false })
@@ -989,12 +1362,6 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
     for (const r of running.values()) closeWindow(r)
     for (const id of running.keys()) await stopAgent($, id)
   }
-  // Answers whose rewrite could not be had are shortened here, all at once (cut, marked, when that fails too).
-  await Promise.all(
-    results.map(async (r, i) => {
-      if (r && r.shorten) results[i] = await shortened($, e.questions[i], r, maxChars, model, signal)
-    }),
-  )
   await Promise.all(
     results.map(async (r, i) => {
       const scope = agentOf[i] !== undefined ? await scopeOf($, agentOf[i]) : undefined
@@ -1004,6 +1371,287 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
   const text = formatResults(results, maxChars)
   if (results.every((r) => !r.ok)) return { deny: 'probe: すべての問いが失敗した。\n' + text }
   return { result: text }
+}
+
+// ---------------------------------------------------------------- savings estimate
+//
+// After each probe call of the main loop, one line for the person ($.ui.log: drawn under the call, not sent
+// to the model, not kept in the transcript file): what the call saved in API prices against the main loop
+// doing the same work itself. The calculation is the trial script's of 2026-11-05 (docs/design.md, 節約の
+// 見積もり), read from the same transcript files: the main loop's and each subagent's.
+
+const PRICE_OPUS = { in: 4, w5: 5, w1h: 8, read: 0.2, out: 20 } // $ per million tokens, claude-opus-5-5
+const PRICE_HAIKU = [0.1, 0.5] // claude-haiku-5-5 input and output, a prompt of up to 100K tokens
+const PRICE_HAIKU_LONG = [0.5, 2.5] // above that
+const HAIKU_LONG_AT = 100_000
+const PER_M = 1_000_000
+const TRANSCRIPT_READ_MAX = 4 * 1024 * 1024 - 1024 // $.fs.read rejects over 4 MiB: a longer file is read from its end
+const SAVINGS_TRIES = 8 // estimates tried for a call (main-loop steps) before the request after it is given up on
+const SAVINGS_CAP = 64
+
+/** Prices of a claude-haiku-5-5 request by its prompt (input, cache writes 5 m / 1 h, cache read, output). */
+export function haikuPrice(prompt) {
+  const [i, o] = prompt > HAIKU_LONG_AT ? PRICE_HAIKU_LONG : PRICE_HAIKU
+  return { in: i, w5: i * 1.25, w1h: i * 2, read: i * 0.1, out: o }
+}
+
+/** The rows of a JSONL transcript; a line that does not parse (cut by a read from the end, half written) is left out. */
+export function recordRows(text) {
+  const rows = []
+  for (const line of String(text ?? '').split('\n')) {
+    const t = line.trim()
+    if (t === '') continue
+    try {
+      const d = JSON.parse(t)
+      if (d !== null && typeof d === 'object' && !Array.isArray(d)) rows.push(d)
+    } catch {}
+  }
+  return rows
+}
+
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
+const messageOf = (d) => (isObject(d.message) ? d.message : {})
+
+/**
+ * The model requests of a transcript in order. One response is kept as a row per content block, all with
+ * its usage: they are merged by message id. `before` lists what reached the model since the last request:
+ * ['result', tool_use_id] or ['text', text].
+ */
+export function requestsOf(rows) {
+  const reqs = []
+  const index = new Map()
+  let pending = []
+  rows.forEach((d, pos) => {
+    const m = messageOf(d)
+    if (d.type === 'user') {
+      if (typeof m.content === 'string') pending.push(['text', m.content])
+      else if (Array.isArray(m.content)) {
+        for (const b of m.content) {
+          if (isObject(b) && b.type === 'tool_result') pending.push(['result', b.tool_use_id])
+          else if (isObject(b) && b.type === 'text') pending.push(['text', b.text ?? ''])
+        }
+      }
+    }
+    if (d.type === 'assistant' && m.usage) {
+      let r = index.get(m.id)
+      if (r === undefined) {
+        const u = m.usage
+        const cc = isObject(u.cache_creation) ? u.cache_creation : {}
+        r = {
+          id: m.id, pos, time: d.timestamp ?? null, model: m.model,
+          in: u.input_tokens || 0, w: u.cache_creation_input_tokens || 0, w1h: cc.ephemeral_1h_input_tokens || 0,
+          read: u.cache_read_input_tokens || 0, out: u.output_tokens || 0, tools: [], stop: null, before: pending,
+        }
+        r.prompt = r.in + r.w + r.read
+        r.new = r.in + r.w
+        index.set(m.id, r)
+        reqs.push(r)
+        pending = []
+      }
+      r.stop = m.stop_reason || r.stop
+      for (const b of Array.isArray(m.content) ? m.content : []) {
+        if (isObject(b) && b.type === 'tool_use') r.tools.push([b.name, b.id])
+      }
+    }
+  })
+  return reqs
+}
+
+/** A value as Python's json.dumps(ensure_ascii=False) writes it (the script measures tool inputs so). */
+function pyDumps(v) {
+  if (v === null || v === undefined) return 'null'
+  if (typeof v === 'string') return JSON.stringify(v)
+  if (typeof v === 'boolean') return v ? 'true' : 'false'
+  if (typeof v === 'number') return Number.isInteger(v) ? String(v) : JSON.stringify(v)
+  if (Array.isArray(v)) return '[' + v.map(pyDumps).join(', ') + ']'
+  return '{' + Object.entries(v).map(([k, x]) => JSON.stringify(k) + ': ' + pyDumps(x)).join(', ') + '}'
+}
+
+const codePoints = (s) => [...String(s)].length // Python's len
+
+function resultText(b) {
+  if (typeof b.content === 'string') return b.content
+  if (Array.isArray(b.content)) return b.content.map((x) => (isObject(x) && typeof x.text === 'string' ? x.text : '')).join('')
+  return ''
+}
+
+/** Writes of `tokens` to the cache, the 1-hour share at its price and the rest at the 5-minute one. */
+const costNew = (tokens, share1h, p) => (tokens * (share1h * p.w1h + (1 - share1h) * p.w5)) / PER_M
+
+/** What a subagent's requests cost at claude-haiku-5-5 prices. */
+export function childCost(reqs) {
+  let total = 0
+  for (const r of reqs) {
+    const p = haikuPrice(r.prompt)
+    total += (r.in * p.in + (r.w - r.w1h) * p.w5 + r.w1h * p.w1h + r.read * p.read + r.out * p.out) / PER_M
+  }
+  return total
+}
+
+/** The steps the main loop would take for a subagent: up to its first answer (no tool, or only the hand-back). */
+function replaySteps(reqs) {
+  const steps = []
+  for (const r of reqs) {
+    steps.push(r)
+    if (r.tools.length === 0 || r.tools.every(([n]) => n === HANDBACK_TOOL)) return { steps, answered: true }
+  }
+  return { steps, answered: false }
+}
+
+/** The probe calls of the main-loop request that made the call `id`, or undefined while it is not in the rows. */
+export function probeGroupOf(prows, id) {
+  const r = requestsOf(prows).find((x) => x.tools.some(([, t]) => t === id))
+  return r === undefined ? undefined : r.tools.filter(([n]) => n === PROBE_TOOL).map(([, t]) => t)
+}
+
+/**
+ * The estimate for the probe calls `ids` of one main-loop request, given the rows of the main loop's
+ * transcript and of each of their subagents' (kidRows), as the trial script computes it:
+ *   saved: 1a the context C read again by the K-1 requests more, 1b what the work added to it, read again,
+ *          2 what the work wrote to the cache, 4 the main loop's output (the subagent's stands in for it);
+ *   spent: 1 the output of the request that called probe, 2 the subagents, 3 the answer written to the cache.
+ * status: 'ok', 'pending' (the request after the result is not in the rows yet), 'interrupted' (the result
+ * never reached the main loop), 'no-children', 'missing' (the call is not in the rows).
+ */
+export function savingsOf(prows, ids, kidRows) {
+  const preqs = requestsOf(prows)
+  const input = new Map()
+  const result = new Map()
+  for (const d of prows) {
+    const m = messageOf(d)
+    if (!Array.isArray(m.content)) continue
+    for (const b of m.content) {
+      if (!isObject(b)) continue
+      if (d.type === 'assistant' && b.type === 'tool_use') input.set(b.id, b.input || {})
+      if (d.type === 'user' && b.type === 'tool_result' && !result.has(b.tool_use_id)) result.set(b.tool_use_id, resultText(b))
+    }
+  }
+  const written = preqs.reduce((s, r) => s + r.w, 0) || 1
+  const share1h = preqs.reduce((s, r) => s + r.w1h, 0) / written
+  const i = preqs.findIndex((x) => x.tools.some(([, t]) => ids.includes(t)))
+  if (i < 0) return { status: 'missing' }
+  const r = preqs[i]
+  const group = r.tools.filter(([n]) => n === PROBE_TOOL).map(([, t]) => t)
+  const others = r.tools.filter(([n]) => n !== PROBE_TOOL).map(([, t]) => t)
+  const size = (t) => codePoints(pyDumps(input.get(t) ?? {}))
+  const sum = (ts, f) => ts.reduce((s, t) => s + f(t), 0)
+  const shareOut = sum(group, size) / (sum([...group, ...others], size) || 1)
+  const res = (t) => codePoints(result.get(t) ?? '')
+  const shareRes = sum(group, res) / (sum([...group, ...others], res) || 1)
+  const kids = kidRows.map(requestsOf)
+  if (kids.length === 0) return { status: 'no-children' }
+  if (group.some((t) => (result.get(t) ?? '').startsWith('[Tool call interrupted'))) return { status: 'interrupted' }
+  const next = preqs.slice(i + 1).find((x) => x.before.some(([k, v]) => k === 'result' && group.includes(v)))
+  if (next === undefined) return { status: 'pending' }
+  const C = r.prompt
+  let K = 0
+  let save1b = 0
+  let save2 = 0
+  let save4 = 0
+  for (const reqs of kids) {
+    if (reqs.length === 0) continue // no request recorded: nothing to replay (the script stops here)
+    const { steps, answered } = replaySteps(reqs)
+    const c1 = steps[0].prompt
+    const calling = answered ? steps.slice(0, -1) : steps
+    K += calling.length
+    for (const s of steps.slice(1)) {
+      save1b += (Math.max(s.prompt - c1 - s.new, 0) * PRICE_OPUS.read) / PER_M
+      save2 += costNew(s.new, share1h, PRICE_OPUS)
+    }
+    save4 += (calling.reduce((n, s) => n + s.out, 0) * PRICE_OPUS.out) / PER_M
+  }
+  const save1a = (Math.max(K - 1, 0) * C * PRICE_OPUS.read) / PER_M
+  const add1 = (r.out * shareOut * PRICE_OPUS.out) / PER_M
+  const add2 = kids.reduce((s, reqs) => s + childCost(reqs), 0)
+  const add3 = costNew(next.new * shareRes, share1h, PRICE_OPUS)
+  const net = save1a + save1b + save2 + save4 - add1 - add2 - add3
+  return { status: 'ok', C, K, save1a, save1b, save2, save4, add1, add2, add3, net }
+}
+
+/**
+ * The line shown under a probe call: the saving in dollars, and as a share of what the main loop would have
+ * paid without probe (the saved parts, 1a + 1b + 2 + 4; what both ways pay alike is in neither). Without
+ * saved parts (no tool step to replay) there is no share to give.
+ */
+export function savingsLine(s) {
+  const without = s.save1a + s.save1b + s.save2 + s.save4
+  const line = `推定節約${s.net.toFixed(2)}$(API相当)`
+  return without > 0 ? `${line}　未使用時の${Math.round((s.net / without) * 100)}%削減` : line
+}
+
+const callChildren = new Map() // tool_use_id of a main-loop probe call -> its subagents' ids
+const savingsPending = new Map() // tool_use_id -> estimates left to try
+let sessionDir // [session id, the directory its transcript is in]
+
+/** The directory under the config's projects/ that holds this session's transcript. */
+async function sessionDirOf($, sid) {
+  if (sessionDir && sessionDir[0] === sid) return sessionDir[1]
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${await $.env.get('HOME')}/.claude`
+  const projects = `${config}/projects`
+  for (const entry of await $.fs.list(projects)) {
+    if (entry.kind === 'file') continue // 'dir', or 'other' for a link to one
+    if (await $.fs.exists(`${projects}/${entry.name}/${sid}.jsonl`)) {
+      sessionDir = [sid, `${projects}/${entry.name}`]
+      return sessionDir[1]
+    }
+  }
+  return undefined
+}
+
+/** A transcript's text; over what $.fs.read takes, its last part (the calls looked for are the latest). */
+async function readTranscript($, path) {
+  const { size } = await $.fs.stat(path)
+  if (size <= TRANSCRIPT_READ_MAX) return String(await $.fs.read(path))
+  const r = await $.process.run(['tail', '-c', String(TRANSCRIPT_READ_MAX), path], { timeoutMs: 10000 })
+  if (r.exitCode !== 0) throw new Error(`tail: ${r.stderr}`)
+  return r.stdout
+}
+
+/** Shows the line of each main-loop probe call whose estimate can be made now; the rest wait (a few tries). */
+async function showSavings($) {
+  if (savingsPending.size === 0) return
+  const sid = await $.session.id()
+  const dir = await sessionDirOf($, sid)
+  if (dir === undefined) {
+    await traceLine($, { hook: 'savings', error: `no transcript directory for session ${sid}`, pending: [...savingsPending.keys()] })
+    savingsPending.clear()
+    return
+  }
+  const prows = recordRows(await readTranscript($, `${dir}/${sid}.jsonl`))
+  for (const [id, left] of [...savingsPending]) {
+    if (!savingsPending.has(id)) continue // shown with another call of its request
+    const ids = probeGroupOf(prows, id) ?? [id]
+    const kidRows = []
+    for (const agentId of ids.flatMap((t) => callChildren.get(t) ?? [])) {
+      try {
+        kidRows.push(recordRows(await $.fs.read(`${dir}/${sid}/subagents/agent-${agentId}.jsonl`)))
+      } catch {
+        kidRows.push([])
+      }
+    }
+    const s = savingsOf(prows, ids, kidRows)
+    await traceLine($, { hook: 'savings', ids, children: kidRows.map((k) => k.length), rows: prows.length, status: s.status, net: s.net, left })
+    if (s.status === 'pending' || s.status === 'missing') {
+      if (left <= 1) savingsPending.delete(id)
+      else savingsPending.set(id, left - 1)
+      continue
+    }
+    for (const t of ids) savingsPending.delete(t)
+    if (s.status === 'ok') {
+      try {
+        $.ui.log(savingsLine(s))
+      } catch {}
+    }
+  }
+}
+
+async function trySavings($) {
+  try {
+    await showSavings($)
+  } catch (err) {
+    await traceLine($, { hook: 'savings', error: String(err && err.message ? err.message : err), pending: [...savingsPending.keys()] })
+    savingsPending.clear() // the files cannot be read here: no estimate this time
+  }
 }
 
 // ---------------------------------------------------------------- hooks
@@ -1037,7 +1685,10 @@ export function register(on) {
   // A probe call's effort, on each model request of the children it started (a spawn takes no effort).
   on('turn.step', async function* ($, e, next) {
     const effort = e.agentId === undefined ? undefined : childCalls.get(e.agentId)?.effort
-    return yield* next(effort === undefined || effort === e.effort ? e : { ...e, effort })
+    const step = yield* next(effort === undefined || effort === e.effort ? e : { ...e, effort })
+    // A main-loop request is done: a probe call before it may have its savings line now.
+    if (e.agentId === undefined && savingsPending.size > 0) await trySavings($)
+    return step
   })
 
   // This plugin's own calls, not the model's: the Agent call that starts a probe subagent and the
@@ -1059,12 +1710,23 @@ export function register(on) {
     if (e.agentId !== undefined) {
       completions.set(e.agentId, { answer: e.answer, reason: e.reason })
       while (completions.size > COMPLETIONS_CAP) completions.delete(completions.keys().next().value)
+      return next(e)
     }
-    return next(e)
+    const r = await next(e)
+    if (savingsPending.size > 0) await trySavings($) // the turn's last request is in the transcript by now
+    return r
   })
 
-  on('tool.call', { tool: PROBE_TOOL }, async ($, e, next) => runProbe($, e, next.signal))
-    .catch(($, e, next) => ({ deny: failureText(next.error) }))
+  on('tool.call', { tool: PROBE_TOOL }, async ($, e, next) => {
+    const result = await runProbe($, e, next.signal)
+    // Its savings line waits for the main loop's request after the result (the answer it writes counts).
+    await traceLine($, { hook: 'savings', call: e.tool_use_id ?? null, agentId: e.agentId ?? null, children: callChildren.get(e.tool_use_id) ?? [] })
+    if (e.agentId === undefined && typeof e.tool_use_id === 'string') {
+      savingsPending.set(e.tool_use_id, SAVINGS_TRIES)
+      while (savingsPending.size > SAVINGS_CAP) savingsPending.delete(savingsPending.keys().next().value)
+    }
+    return result
+  }).catch(($, e, next) => ({ deny: failureText(next.error) }))
 
   // The context tool: only a probe subagent may call it; it reads the conversation of its requester.
   on('tool.call', { tool: CONTEXT_TOOL }, async ($, e, next) => readContext($, e))
@@ -1090,7 +1752,8 @@ export function register(on) {
   })
 
   // Innermost: a probe subagent asked for its answer so far (past its time) may call no tool but the
-  // hand-back that carries the answer. The context tool answers above this, so it checks the same itself.
+  // hand-back that carries the answer. The context tool answers above this, so it refuses itself. A
+  // throw in `next` reaches the catch, whose `next` replays what it settled to (nothing runs twice).
   on('tool.call', async ($, e, next) => (wrappingUp(e) ? { deny: WRAPUP_DENY } : next(e))).catch(($, e, next) => next(e))
 
   // No sandbox here: a probe subagent's Bash runs only when Bash itself finds the command read-only.
@@ -1112,10 +1775,18 @@ export function register(on) {
   //     (not through session.send); a running turn receives it as a `queued_command`
   //     attachment (a "Another Claude session sent a message while you were working"
   //     reminder), an idle session takes it from the queue as a prompt.
-  //     In the running turn: prompt.attachment leaves it out of the request.
+  //     In the running turn: prompt.attachment leaves it out of the request. The row is stored first
+  //     (session.append below cuts it to a stub) and a request carries it as stored, so the stub is
+  //     what this hook sees: it leaves that out too, and so the cut task-notification of (2).
+  // Debugging aid: what every attachment that looks like a delivery holds, as it is about to be sent.
+  on('prompt.attachment', async ($, e, next) => {
+    await trace($, 'prompt.attachment (any)', e, undefined)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('prompt.attachment', { type: 'queued_command' }, async ($, e, next) => {
     const senders = handbackSendersOf(e.text)
-    const drop = senders !== undefined && (await allProbeSenders($, senders))
+    const drop = onlyStubs(e.text) || (senders !== undefined && (await allProbeSenders($, senders)))
     await trace($, 'prompt.attachment', e, drop ? 'left out' : 'passed')
     return drop ? { text: null } : next(e)
   }).catch(($, e, next) => next(e))
@@ -1132,18 +1803,15 @@ export function register(on) {
     return drop ? { drop: 'probe: probe の hand-back は tool の結果に含まれている' } : next(e)
   }).catch(($, e, next) => next(e))
 
-  //     Fallback for either path: a row cannot be refused at session.append, but its text can
-  //     be replaced by a one-line stub.
-  on('session.append', { origin: { kind: ['peer', 'coordinator', 'unclassified'] } }, cutRow).catch(($, e, next) => next(e))
+  //     For either path: a row cannot be refused at session.append, but its text can be replaced
+  //     by a one-line stub (which prompt.attachment above then leaves out).
+  on('session.append', { origin: { kind: ['peer', 'coordinator', 'unclassified', 'task-notification'] } }, cutRow).catch(($, e, next) => next(e))
   on('session.append', { door: ['attachment', 'delivery'] }, cutRow).catch(($, e, next) => next(e))
 
-  // (2) its task-notification.
+  // (2) its task-notification: an idle session's is dropped here; one delivered into a running turn is
+  //     cut by session.append above and its stub left out by prompt.attachment.
   on('prompt.submit', { origin: { kind: 'task-notification' } }, async ($, e, next) => {
-    const ids = taskIdsOf(e.text)
-    if (ids.length === 0) return next(e)
-    for (const id of ids) {
-      if (!(await isProbeAgent($, id))) return next(e)
-    }
+    if (!(await probeNotification($, e.text))) return next(e)
     return { drop: 'probe: probe の完了通知は tool の結果に含まれている' }
   }).catch(($, e, next) => next(e))
 }
