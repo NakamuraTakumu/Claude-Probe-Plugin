@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, SANDBOXES, shortenPrompt, shQuote, taskIdsOf, wrapCommand } from '../hooks/register.js'
+import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, BASH_DEFAULT_TIMEOUT_MS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, SANDBOXES, shortenPrompt, shQuote, stopSeconds, stoppedNote, taskIdsOf, wrapCommand } from '../hooks/register.js'
 
 const AGENT = 'probe:probe'
 const TOOL = 'mcp__probe__probe'
@@ -538,7 +538,7 @@ test('rewrite: the read-only gate still wraps the Bash of a rewritten subagent',
     if (w.sends.length === 1 && r === undefined) r = await asAgent($, 'agent-1', { tool: 'Bash', command: 'ls /' })
   })
   await probe($, { questions: ['a'] })
-  expect(w.bash).toEqual([wrapCommand('ls /')])
+  expect(w.bash).toEqual([wrapCommand('ls /', 115)])
 })
 
 // ------------------------------------------------------------------ the engine's resume gate, and the fallback
@@ -1057,11 +1057,14 @@ test('Bash of a probe subagent runs inside bwrap: read-only file system, TMPDIR 
   await start($)
   const command = `echo 'it''s'; ls "$HOME" | head -3`
   await asAgent($, 'p1', { tool: 'Bash', command })
-  expect(w.bash).toEqual([wrapCommand(command)])
+  expect(w.bash).toEqual([wrapCommand(command, 115)])
+  const inner =
+    `timeout -k 2 115 bash -c ${shQuote(command)}; r=$?; ` +
+    `if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then echo '（probe が 115 秒で打ち切った。対象を絞るか、Bash の timeout を長く指定する）' >&2; fi; exit $r`
   expect(w.bash[0]).toBe(
-    `bwrap --ro-bind / / --dev /dev --proc /proc --setenv TMPDIR /dev/shm --unshare-net --die-with-parent -- bash -c ${shQuote(command)}`,
+    `bwrap --ro-bind / / --dev /dev --proc /proc --setenv TMPDIR /dev/shm --unshare-net --die-with-parent -- bash -c ${shQuote(inner)}`,
   )
-  expect(w.bash[0]).toContain(`'echo '\\''it'\\'''\\''s'\\''; ls "$HOME" | head -3'`)
+  expect(inner).toContain(`'echo '\\''it'\\'''\\''s'\\''; ls "$HOME" | head -3'`)
   // others are not touched: another subagent, the main loop
   await asAgent($, 'o1', { tool: 'Bash', command: 'ls' })
   await asAgent($, undefined, { tool: 'Bash', command: 'pwd' })
@@ -1108,7 +1111,7 @@ test('sandbox: checked once per probe call, by its first child Bash; a later cal
   await probe($, { questions: ['b'] }) // agent-2: none from the first call is carried on
   await asAgent($, 'agent-2', { tool: 'Bash', command: 'ls' })
   // the first call had none, so only what Bash finds read-only ran (nothing here); the second's is wrapped
-  expect(w.bash).toEqual([wrapCommand('ls')])
+  expect(w.bash).toEqual([wrapCommand('ls', 115)])
   expect(checks()).toBe(4)
 })
 
@@ -1179,7 +1182,7 @@ for (const value of ['', 'on', '1', 'false', 'OFF', 'off ', 'no']) {
       const w = world($, on, { bwrap, agents: [{ id: 'p1', type: AGENT, status: 'running', description: 'probe' }] })
       await start($)
       await asAgent($, 'p1', { tool: 'Bash', command: 'ls' })
-      expect(w.bash).toEqual(bwrap ? [wrapCommand('ls')] : [])
+      expect(w.bash).toEqual(bwrap ? [wrapCommand('ls', 115)] : [])
       expect((await bashCheck($, 'p1', false)).decision).toBe(bwrap ? 'allow' : 'deny')
     })
   }
@@ -1228,7 +1231,7 @@ test('a probe subagent is known from the spawn even when the agent list cannot s
     if (r === undefined) r = await asAgent($, 'agent-1', { tool: 'Bash', command: 'ls /' })
   })
   await probe($, { questions: ['a'] })
-  expect(w.bash).toEqual([wrapCommand('ls /')])
+  expect(w.bash).toEqual([wrapCommand('ls /', 115)])
 })
 
 test('if the gate itself throws during a probe run, an unclassified subagent is refused; outside a run it passes', async ($, on) => {
@@ -1499,6 +1502,32 @@ test('formatResults numbers sections, caps long answers, writes no path lines', 
   expect(formatResults([{ ok: true, text: 'abc', note: '…(要約。元は 900 文字)' }], 500)).toBe('abc\n…(要約。元は 900 文字)')
   expect(shortenPrompt('Q', 'A'.repeat(3), 3, 500)).toBe(['次は調べものの依頼と、その答えである。答えが長すぎるので、500 字以内に書き直す。', '結論を先に書く。数値・名前・ファイル:行・原文の引用など必要な情報だけ残し、経過・前置き・注意書きは削る。答えにないことは書かない。日本語で、書き直した結果だけを返す。', '', '【依頼】', 'Q', '', '【答え（3 字）】', 'AAA'].join('\n'))
   expect(rewriteRequest(2500, 2000)).toBe('結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。')
+})
+
+test('stopSeconds: 5 s before the Bash call\'s own timeout (its timeout, else the default; 10 minutes at most)', () => {
+  expect(BASH_DEFAULT_TIMEOUT_MS).toBe(120000)
+  expect(stopSeconds(undefined)).toBe(115)
+  expect(stopSeconds(300000)).toBe(295)
+  expect(stopSeconds(9999999)).toBe(595)
+  expect(stopSeconds(3000)).toBe(1)
+  expect(stopSeconds(0)).toBe(115)
+  expect(stopSeconds(undefined, 30000)).toBe(25)
+})
+
+test('wrapCommand with seconds stops the command inside the sandbox and says so', () => {
+  const w = wrapCommand('sleep 9', 4)
+  expect(w.startsWith(`bwrap ${BWRAP_ARGS.join(' ')} -- bash -c `)).toBe(true)
+  expect(w).toContain('timeout -k 2 4 bash -c')
+  expect(w).toContain(stoppedNote(4).replace(/'/g, "'\\''"))
+})
+
+test('a probe subagent\'s Bash is stopped before its own timeout, the default one from the environment', async ($, on) => {
+  mock.env(on, { BASH_DEFAULT_TIMEOUT_MS: '30000' })
+  const w = world($, on, { agents: [{ id: 'p1', type: AGENT, status: 'running', description: 'probe' }] })
+  await start($)
+  await asAgent($, 'p1', { tool: 'Bash', command: 'ls' })
+  await asAgent($, 'p1', { tool: 'Bash', command: 'make', timeout: 600000 })
+  expect(w.bash).toEqual([wrapCommand('ls', 25), wrapCommand('make', 595)])
 })
 
 test('outcomeOf, taskIdsOf, handbackSendersOf, shQuote and wrapCommand', () => {

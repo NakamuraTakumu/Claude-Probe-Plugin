@@ -195,8 +195,37 @@ export function shQuote(s) {
 }
 
 /** The command line that runs `command` inside bwrap (whole file system read-only). */
-export function wrapCommand(command) {
-  return `bwrap ${BWRAP_ARGS.join(' ')} -- bash -c ${shQuote(command)}`
+// With `seconds`, the command is stopped that long after it starts (TERM, then KILL 2 s later), so that it ends
+// before Bash's own timeout: past that Bash moves it to the background, where it runs on after the probe call
+// and its completion notice reaches the conversation that called probe.
+export function wrapCommand(command, seconds) {
+  if (seconds === undefined) return `bwrap ${BWRAP_ARGS.join(' ')} -- bash -c ${shQuote(command)}`
+  const inner =
+    `timeout -k 2 ${seconds} bash -c ${shQuote(command)}; r=$?; ` +
+    `if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then echo ${shQuote(stoppedNote(seconds))} >&2; fi; exit $r`
+  return `bwrap ${BWRAP_ARGS.join(' ')} -- bash -c ${shQuote(inner)}`
+}
+
+export function stoppedNote(seconds) {
+  return `（probe が ${seconds} 秒で打ち切った。対象を絞るか、Bash の timeout を長く指定する）`
+}
+
+// Bash's own timeout for a call: its `timeout` (ms) if given, else BASH_DEFAULT_TIMEOUT_MS, else 2 minutes; at
+// most 10 minutes. The command is stopped STOP_MARGIN_S before it.
+export const BASH_DEFAULT_TIMEOUT_MS = 120000
+const BASH_MAX_TIMEOUT_MS = 600000
+const STOP_MARGIN_S = 5
+export function stopSeconds(timeoutMs, defaultMs = BASH_DEFAULT_TIMEOUT_MS) {
+  const given = typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : defaultMs
+  return Math.max(1, Math.floor(Math.min(given, BASH_MAX_TIMEOUT_MS) / 1000) - STOP_MARGIN_S)
+}
+async function bashDefaultMs($) {
+  try {
+    const v = Number(await $.env.get('BASH_DEFAULT_TIMEOUT_MS'))
+    return Number.isFinite(v) && v > 0 ? v : BASH_DEFAULT_TIMEOUT_MS
+  } catch {
+    return BASH_DEFAULT_TIMEOUT_MS
+  }
 }
 
 /** Length in characters (code points, so that a surrogate pair is one). */
@@ -924,7 +953,8 @@ export function register(on) {
     if (e.run_in_background === true) return { deny: 'probe では run_in_background は使えない。コマンドの終了を待つ形で実行する。' }
     if (typeof e.command !== 'string' || !e.command.trim() || (await sandboxOff($))) return next(e)
     const box = await sandboxOf($, e.agentId)
-    return next(box ? { ...e, command: box.wrap(e.command) } : e) // no sandbox: the tool.check below
+    if (!box) return next(e) // no sandbox: the tool.check below
+    return next({ ...e, command: box.wrap(e.command, stopSeconds(e.timeout, await bashDefaultMs($))) })
   }).catch(($, e, next) => {
     if (next.called) return next(e)
     if (e.agentId === undefined) return next(e)

@@ -15,7 +15,7 @@ Claude Code の調べものを Haiku に任せて、Claude 本体の quota を�
 
 ### 1. 前提
 
-- **Claude Code**：2.1.310 で確かめた。mod の API は early access なので、ほかの版では動かないことがある。
+- **Claude Code**：2.1.318 で確かめた。mod の API は early access なので、ほかの版では動かないことがある。
 - **auto mode**：manual モードでは Haiku のコマンドが断られる。
 - **OS のサンドボックス**：ないと、Haiku は読むだけのコマンドしか実行できない。
   - Linux：bubblewrap（`sudo apt install bubblewrap` など）。`bwrap --ro-bind / / --dev /dev --proc /proc true && echo OK` で OK と出れば使える。
