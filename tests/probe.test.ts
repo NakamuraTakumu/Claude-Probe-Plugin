@@ -1,11 +1,11 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, BASH_DEFAULT_TIMEOUT_MS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, SANDBOXES, shortenPrompt, shQuote, stopSeconds, stoppedNote, taskIdsOf, wrapCommand } from '../hooks/register.js'
+import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, BASH_DEFAULT_TIMEOUT_MS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, SANDBOXES, WRAPUP_DENY, wrapupRequest, callLine, scopeText, shortenPrompt, shQuote, stopSeconds, stoppedNote, taskIdsOf, wrapCommand } from '../hooks/register.js'
 
 const AGENT = 'probe:probe'
 const TOOL = 'mcp__probe__probe'
 const CONTEXT = 'mcp__probe__context'
 
-type Script = { answer?: string; reason?: string; parks?: number; never?: boolean; deny?: string; then?: Script }
+type Script = { answer?: string; reason?: string; parks?: number; never?: boolean; deny?: string; then?: Script; wrapup?: Script }
 
 /**
  * The engine beneath the plugin, as far as the plugin reaches it: registration,
@@ -13,7 +13,7 @@ type Script = { answer?: string; reason?: string; parks?: number; never?: boolea
  * its next run follows `then` of its script), the `sleep` park (the subagents finish
  * there, by script), bwrap, TaskStop and the clock.
  */
-function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; sleep?: boolean; send?: 'refuse' | 'throw'; shorten?: 'ok' | 'long' | 'throw' | 'none'; messages?: any[] | 'throw' | 'deny'; usage?: string | 'missing'; sleepFails?: number; script?: (prompt: string, n: number) => Script; agents?: any[]; listThrows?: boolean; clockThrows?: boolean; names?: Record<string, string>; trace?: boolean; bashOut?: { stdout: string; stderr?: string; isError?: boolean } } = {}) {
+function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; sleep?: boolean; send?: 'refuse' | 'throw'; shorten?: 'ok' | 'long' | 'throw' | 'none'; messages?: any[] | 'throw' | 'deny'; usage?: string | 'missing'; sleepFails?: number; script?: (prompt: string, n: number) => Script; agents?: any[]; listThrows?: boolean; clockThrows?: boolean; names?: Record<string, string>; trace?: boolean; childMessages?: Record<string, any[] | 'throw'>; bashOut?: { stdout: string; stderr?: string; isError?: boolean } } = {}) {
   if (options.clockThrows) on('clock.now', () => { throw new Error('boom') })
   const w = {
     clock: options.clockThrows ? (undefined as any) : mock.clock(on),
@@ -48,6 +48,11 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
     return { value: { tool: 'mcp__probe__' + e.name } }
   })
   on('session.messages', (_$: any, e: any) => {
+    // a probe subagent's own transcript (read for the scope list under its answer)
+    if (e && typeof e.agentId === 'string' && e.agentId.startsWith('agent-')) {
+      if ((options.childMessages as any)?.[e.agentId] === 'throw') throw new Error('transcript down')
+      return { value: options.childMessages?.[e.agentId] ?? [] }
+    }
     w.messageCalls.push(e)
     if (options.messages === 'throw') throw new Error('transcript down')
     if (options.messages === 'deny') return { value: { deny: 'unreadable' } }
@@ -91,6 +96,12 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
     const offered = await $.agent.offer({ agent: AGENT, description: 'd', source: 'plugin', provider: { plugin: 'probe', tier: 'user' } } as any)
     if (!offered.isOffered) return { isDelivered: false, reason: `Agent type '${AGENT}' is not offered in this session.` }
     const id = String(e.to)
+    // A message to a running subagent: it reads it on its next step (its script's `wrapup` from then on).
+    const running = w.live.get(id)
+    if (running) {
+      if (running.script.wrapup) w.live.set(id, { prompt: running.prompt, script: running.script.wrapup, parks: 0 })
+      return { isDelivered: true }
+    }
     const prev = w.finished.get(id)
     if (!prev) return { isDelivered: false, reason: 'no such agent' }
     w.finished.delete(id)
@@ -149,6 +160,11 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
   return w
 }
 
+// Every answer carries its scope list; with the test engine's empty transcripts it says no tool was
+// called. Tests about other things read the answer without it (the scope tests read it whole).
+const NO_CALLS = '\n\n調べた範囲（呼び出し 0 回）：ツールは使っていない。'
+const bare = (t: any) => (typeof t === 'string' ? t.split(NO_CALLS).join('') : t)
+
 const offerInput = (agent: string) => ({ agent, description: 'd', source: 'plugin', provider: { plugin: 'x', tier: 'user' } }) as any
 const start = ($: any) => $.session.start({ cwd: '/tmp', surface: null, isInteractive: false })
 const probe = ($: any, input: Record<string, unknown>) => ($.tool.call as any)({ tool: TOOL, ...input })
@@ -189,7 +205,7 @@ test('session.start registers the hidden probe agent and the probe tool', async 
     '読み取り専用のシェルで調べて、結論か関係する原文の引用だけを返す。ファイルの検索、コマンドやテストの実行、Web 検索ができ、条件を明示すれば分岐を含む手順も任せられる。' +
       '向くのは、どこにあるか分からないものを広く探すとき、多くのファイルにまたがるとき、長い出力（ログ、コマンドの出力）から要点だけ欲しいとき、Web で調べるとき。これから編集する箇所と、すぐ済む確認は自分でやる。' +
       '判断は、基準を問いに書けるなら任せられる。会話全体の文脈や好みに依る判断は任せず、材料集めに使う。' +
-      '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれ、見つからなかったときは探した範囲が書かれる。',
+      '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれる。答えの後ろには、調べた範囲（使ったツールの一覧）が付く。',
   )
   expect(Object.keys(t.inputSchema.properties)).toEqual(['questions', 'cwd', 'max_chars', 'context', 'effort'])
   expect(t.inputSchema.properties.questions.description).toContain('複数書くと並列に処理され、結果はまとめて返る（最大4件同時')
@@ -215,8 +231,8 @@ test('probe: one subagent per task, results numbered in task order with no file 
   await start($)
   const r = await probe($, { questions: ['t1', 't2', 't3'], cwd: '/work' })
   expect(typeof r.result).toBe('string')
-  expect(r.result).toBe('## 1\nanswer: t1\n\n## 2\nanswer: t2\n\n## 3\nanswer: t3')
-  expect(r.result).not.toContain('全文')
+  expect(bare(r.result)).toBe('## 1\nanswer: t1\n\n## 2\nanswer: t2\n\n## 3\nanswer: t3')
+  expect(bare(r.result)).not.toContain('全文')
   expect(w.spawns.map((s: any) => s.subagent_type)).toEqual([AGENT, AGENT, AGENT])
   expect(w.spawns.map((s: any) => s.run_in_background)).toEqual([true, true, true])
   expect(w.spawns.map((s: any) => s.model)).toEqual(['haiku', 'haiku', 'haiku'])
@@ -230,7 +246,7 @@ test('probe: the children always run on haiku, a model argument is refused; no c
   for (const model of ['sonnet', 'haiku', 'opus', '']) expect(typeof (await probe($, { questions: ['x'], model })).deny).toBe('string')
   expect(w.spawns.length).toBe(0)
   const r = await probe($, { questions: ['only'] })
-  expect(r.result).toBe('answer: only')
+  expect(bare(r.result)).toBe('answer: only')
   expect(w.spawns[0].model).toBe('haiku')
   expect('cwd' in w.spawns[0] && w.spawns[0].cwd !== undefined).toBe(false)
 })
@@ -241,7 +257,7 @@ test('probe: at most 4 subagents at a time, the rest wait for a free place', asy
   const r = await probe($, { questions: ['a', 'b', 'c', 'd', 'e', 'f'] })
   expect(w.spawns.length).toBe(6)
   expect(w.maxLive).toBe(4)
-  expect(r.result).toBe(['1', '2', '3', '4', '5', '6'].map((i) => `## ${i}\nok`).join('\n\n'))
+  expect(bare(r.result)).toBe(['1', '2', '3', '4', '5', '6'].map((i) => `## ${i}\nok`).join('\n\n'))
 })
 
 test('probe: a failed task shows its error in its own section, the others stay', async ($, on) => {
@@ -250,8 +266,8 @@ test('probe: a failed task shows its error in its own section, the others stay',
   })
   await start($)
   const r = await probe($, { questions: ['ok', 'bad', 'err'] })
-  expect(r.deny).toBe(undefined)
-  expect(r.result).toBe('## 1\nfine\n\n## 2\nERROR: 開始できなかった: no capacity\n\n## 3\nERROR: エラーで終了した\nhalf')
+  expect(bare(r.deny)).toBe(undefined)
+  expect(bare(r.result)).toBe('## 1\nfine\n\n## 2\nERROR: 開始できなかった: no capacity\n\n## 3\nERROR: エラーで終了した\nhalf')
   expect(w.spawns.length).toBe(3)
 })
 
@@ -259,22 +275,61 @@ test('probe: every task failing is a deny, not a result', async ($, on) => {
   world($, on, { script: () => ({ deny: 'nope' }) })
   await start($)
   const r = await probe($, { questions: ['a', 'b'] })
-  expect(r.result).toBe(undefined)
-  expect(r.deny).toContain('すべての問いが失敗した')
-  expect(r.deny).toContain('## 1\nERROR: 開始できなかった: nope')
-  expect(r.deny).toContain('## 2\nERROR')
+  expect(bare(r.result)).toBe(undefined)
+  expect(bare(r.deny)).toContain('すべての問いが失敗した')
+  expect(bare(r.deny)).toContain('## 1\nERROR: 開始できなかった: nope')
+  expect(bare(r.deny)).toContain('## 2\nERROR')
   // a single failed question: deny with the bare text
   const one = await probe($, { questions: ['z'] })
-  expect(one.deny).toBe('probe: すべての問いが失敗した。\nERROR: 開始できなかった: nope')
+  expect(bare(one.deny)).toBe('probe: すべての問いが失敗した。\nERROR: 開始できなかった: nope')
 })
 
-test('probe: a task that never finishes is stopped after 15 minutes and reported', async ($, on) => {
+test('probe: a task that never finishes is asked for its answer so far at 15 minutes, and stopped 2 minutes later', async ($, on) => {
   const w = world($, on, { script: (p) => (p === 'slow' ? { never: true } : { answer: 'quick' }) })
   await start($)
   const r = await probe($, { questions: ['fast', 'slow'] })
+  expect(w.sends.map((x) => x.text)).toEqual([wrapupRequest(15, 2000)])
   expect(w.stopped).toEqual(['agent-2'])
-  expect(r.result).toBe('## 1\nquick\n\n## 2\nERROR: タイムアウト（15 分）。処理を停止した。')
-  expect(w.clock.now()).toBeGreaterThan(15 * 60 * 1000 - 1)
+  expect(bare(r.result)).toBe('## 1\nquick\n\n## 2\nERROR: タイムアウト（15 分）。途中までの答えも 2 分で返らなかった。処理を停止した。')
+  expect(w.clock.now()).toBeGreaterThan(17 * 60 * 1000 - 1)
+  expect((await $.agent.offer(offerInput(AGENT))).isOffered).toBe(false) // the window is shut again
+})
+
+test('wrap-up: the answer so far comes back as an answer like any other, and the tools are refused meanwhile', async ($, on) => {
+  const w = world($, on, { script: () => ({ never: true, wrapup: { answer: '結論: foo は src/a.ts:12。test/ は時間内に調べられなかった。', parks: 2 } }) })
+  await start($)
+  let tool: any, handback: any, ctx: any
+  w.onPark.push(async () => {
+    if (w.sends.length === 1 && tool === undefined) {
+      tool = await asAgent($, 'agent-1', { tool: 'Bash', command: 'ls' })
+      handback = await asAgent($, 'agent-1', { tool: 'SubagentHandback', message: 'm' })
+      ctx = await asAgent($, 'agent-1', { tool: CONTEXT })
+    }
+  })
+  const r = await probe($, { questions: ['x'] })
+  expect(bare(r.result)).toBe('結論: foo は src/a.ts:12。test/ は時間内に調べられなかった。')
+  expect(bare(tool.deny)).toBe(WRAPUP_DENY)
+  expect(bare(handback.deny)).toBeUndefined() // the hand-back that carries the answer still goes
+  expect(bare(ctx.deny)).toBe(WRAPUP_DENY)
+  expect(w.bash).toEqual([])
+  expect(w.stopped).toEqual([])
+})
+
+test('wrap-up: an answer so far above the bound is shortened, not sent back for a rewrite', async ($, on) => {
+  const w = world($, on, { shorten: 'ok', script: () => ({ never: true, wrapup: { answer: longText(2500) } }) })
+  await start($)
+  const r = await probe($, { questions: ['x'] })
+  expect(w.sends.length).toBe(1) // the wrap-up request only
+  expect(w.completes.length).toBe(1)
+  expect(bare(r.result)).toContain('要約')
+})
+
+test('wrap-up: when the request cannot be delivered the task is stopped at once, as before', async ($, on) => {
+  const w = world($, on, { send: 'refuse', script: () => ({ never: true }) })
+  await start($)
+  const r = await probe($, { questions: ['x'] })
+  expect(bare(r.deny)).toContain('ERROR: タイムアウト（15 分）。処理を停止した。')
+  expect(w.clock.now()).toBeLessThan(17 * 60 * 1000)
 })
 
 test('probe: bad input is refused before anything starts', async ($, on) => {
@@ -293,7 +348,7 @@ test('park: where there is no sleep (Windows), it waits with ping; each wait is 
   const w = world($, on, { sleep: false, script: () => ({ answer: 'ok', parks: 3 }) })
   await start($)
   const r = await probe($, { questions: ['a'] })
-  expect(r.result).toBe('ok')
+  expect(bare(r.result)).toBe('ok')
   const waits = w.ran.filter((a) => a[0] === 'sleep' || a[0] === 'ping')
   expect(waits.slice(0, 2)).toEqual([['sleep', '0.5'], ['sleep', '1']])
   expect(waits.slice(2).every((a) => a.join(' ') === 'ping -n 2 127.0.0.1')).toBe(true)
@@ -304,7 +359,7 @@ test('probe: without any sandbox it still starts (the read-only check of tool.ch
   const w = world($, on, { bwrap: false })
   await start($)
   const r = await probe($, { questions: ['a'] })
-  expect(r.deny).toBeUndefined()
+  expect(bare(r.deny)).toBeUndefined()
   expect(w.spawns.length).toBe(1)
 })
 
@@ -312,7 +367,7 @@ test('probe: an exception in the tool hook is a deny', async ($, on) => {
   const w = world($, on, { clockThrows: true })
   await start($)
   const r = await probe($, { questions: ['a'] })
-  expect(r.deny).toMatch(/^probe の実行に失敗した（例外/) // with why, as the .catch was told
+  expect(bare(r.deny)).toMatch(/^probe の実行に失敗した（例外/) // with why, as the .catch was told
   expect(w.spawns.length).toBe(0)
 })
 
@@ -326,10 +381,10 @@ test('park: a call\'s failed waits are not carried to the next call', async ($, 
   const w = world($, on, { sleepFails: 2, script: () => ({ answer: 'ok', parks: 2 }) })
   await start($)
   const waits = () => w.ran.filter((a) => a[0] === 'sleep' || a[0] === 'ping').map((a) => a.join(' '))
-  expect((await probe($, { questions: ['a'] })).result).toBe('ok')
+  expect(bare((await probe($, { questions: ['a'] })).result)).toBe('ok')
   expect(waits()).toEqual(['sleep 0.5', 'sleep 1', 'ping -n 2 127.0.0.1', 'ping -n 2 127.0.0.1'])
   const first = waits().length
-  expect((await probe($, { questions: ['b'] })).result).toBe('ok')
+  expect(bare((await probe($, { questions: ['b'] })).result)).toBe('ok')
   expect(waits().slice(first)).toEqual(['sleep 0.5', 'sleep 0.5']) // starts over, and sleep works again
 })
 
@@ -365,8 +420,8 @@ test('probe: every task carries its bound: the default 2000, or max_chars; the s
   // the edges of the range are fine
   const lo = await probe($, { questions: ['e'], max_chars: 500 })
   const hi = await probe($, { questions: ['f'], max_chars: 8000 })
-  expect(lo.deny).toBe(undefined)
-  expect(hi.deny).toBe(undefined)
+  expect(bare(lo.deny)).toBe(undefined)
+  expect(bare(hi.deny)).toBe(undefined)
   expect(w.spawns.at(-2).prompt).toContain('結果の上限: 500 字')
   expect(w.spawns.at(-1).prompt).toContain('結果の上限: 8000 字')
   expect(w.sends.length).toBe(0)
@@ -376,7 +431,7 @@ test('rewrite: an answer within the bound (at it, too) is never sent back', asyn
   const w = world($, on, { script: (p) => ({ answer: p === 'edge' ? longText(2000) : 'short' }) })
   await start($)
   const r = await probe($, { questions: ['edge', 'small'] })
-  expect(r.result).toBe(`## 1\n${longText(2000)}\n\n## 2\nshort`)
+  expect(bare(r.result)).toBe(`## 1\n${longText(2000)}\n\n## 2\nshort`)
   expect(w.sends).toEqual([])
   expect(w.spawns.length).toBe(2)
 })
@@ -385,14 +440,14 @@ test('rewrite: one request is enough; it goes to the same subagent, the new answ
   const w = world($, on, { script: () => ({ answer: longText(2500), then: { answer: '結論: 短い' } }) })
   await start($)
   const r = await probe($, { questions: ['long one'] })
-  expect(r.result).toBe('結論: 短い')
+  expect(bare(r.result)).toBe('結論: 短い')
   expect(w.sends.length).toBe(1)
   expect(w.sends[0]!.to).toBe('agent-1')
   expect(w.sends[0]!.text).toBe('結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。')
   expect(w.sends[0]!.origin).toMatchObject({ kind: 'plugin' })
   expect(w.spawns.length).toBe(1) // no new subagent
   expect(w.stopped).toEqual([])
-  expect(r.result).not.toContain('切り詰め') // and no trace of the rewrite in the result
+  expect(bare(r.result)).not.toContain('切り詰め') // and no trace of the rewrite in the result
 })
 
 test('rewrite: the bound of max_chars is the one asked for, and it applies to every task alone', async ($, on) => {
@@ -402,7 +457,7 @@ test('rewrite: the bound of max_chars is the one asked for, and it applies to ev
   })
   await start($)
   const r = await probe($, { questions: ['long', 'fine', 'slow'], max_chars: 500 })
-  expect(r.result).toBe(`## 1\nnow short\n\n## 2\n${longText(500)}\n\n## 3\n${longText(100)}`)
+  expect(bare(r.result)).toBe(`## 1\nnow short\n\n## 2\n${longText(500)}\n\n## 3\n${longText(100)}`)
   expect(w.sends.map((s) => [s.to, s.text])).toEqual([
     ['agent-1', '結果が 700 字で、上限 500 字を超えた。結論を先に、500 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。'],
     ['agent-3', '結果が 900 字で、上限 500 字を超えた。結論を先に、500 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。'],
@@ -417,12 +472,12 @@ test('rewrite: two requests at most; if the third answer is still above the boun
     '結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。',
     '結果が 2300 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。',
   ])
-  expect(r.result).toBe(`${longText(2000, 'y')}\n…(切り詰め。元は 2200 文字)`)
+  expect(bare(r.result)).toBe(`${longText(2000, 'y')}\n…(切り詰め。元は 2200 文字)`)
   expect(w.spawns.length).toBe(1)
   expect(w.live.size).toBe(0)
   expect(w.stopped).toEqual([])
   // no note of the number of rewrites
-  expect(r.result).not.toContain('書き直')
+  expect(bare(r.result)).not.toContain('書き直')
 })
 
 test('rewrite: a second request that works ends the loop there', async ($, on) => {
@@ -430,7 +485,7 @@ test('rewrite: a second request that works ends the loop there', async ($, on) =
   await start($)
   const r = await probe($, { questions: ['x'] })
   expect(w.sends.length).toBe(2)
-  expect(r.result).toBe('ok now')
+  expect(bare(r.result)).toBe('ok now')
 })
 
 test('rewrite: the 15 minutes count from the start, the rewrite included; a rewrite that times out leaves the earlier answer, cut', async ($, on) => {
@@ -439,7 +494,7 @@ test('rewrite: the 15 minutes count from the start, the rewrite included; a rewr
   const r = await probe($, { questions: ['x'] })
   expect(w.sends.length).toBe(1)
   expect(w.stopped).toEqual(['agent-1'])
-  expect(r.result).toBe(`${longText(2000)}\n…(切り詰め。元は 2500 文字。書き直し中に 15 分でタイムアウト)`)
+  expect(bare(r.result)).toBe(`${longText(2000)}\n…(切り詰め。元は 2500 文字。書き直し中に 15 分でタイムアウト)`)
   const t = w.clock.now()
   expect(t).toBeGreaterThan(15 * 60 * 1000 - 1)
   expect(t).toBeLessThan(16 * 60 * 1000) // not 14 + 3 minutes
@@ -451,7 +506,7 @@ test('rewrite: a rewrite that does not come back in 3 minutes is given up (the 1
   await start($)
   const r = await probe($, { questions: ['x'] })
   expect(w.stopped).toEqual(['agent-1'])
-  expect(r.result).toBe(`${longText(2000)}\n…(切り詰め。元は 2500 文字。書き直しが 3 分で終わらなかった)`)
+  expect(bare(r.result)).toBe(`${longText(2000)}\n…(切り詰め。元は 2500 文字。書き直しが 3 分で終わらなかった)`)
   expect(w.clock.now()).toBeLessThan(10 * 60 * 1000)
   expect((await $.agent.offer(offerInput(AGENT))).isOffered).toBe(false)
 })
@@ -463,7 +518,7 @@ test('rewrite: a rewrite that gets stuck does not hold up the other tasks, a pla
   await start($)
   const r = await probe($, { questions: ['quick', 'hang', 'rw'] })
   expect(w.stopped.sort()).toEqual(['agent-2', 'agent-3'])
-  expect(r.result).toBe(`## 1\nquick\n\n## 2\nERROR: タイムアウト（15 分）。処理を停止した。\n\n## 3\n${longText(2000)}\n…(切り詰め。元は 3000 文字。書き直しが 3 分で終わらなかった)`)
+  expect(bare(r.result)).toBe(`## 1\nquick\n\n## 2\nERROR: タイムアウト（15 分）。途中までの答えも 2 分で返らなかった。処理を停止した。\n\n## 3\n${longText(2000)}\n…(切り詰め。元は 3000 文字。書き直しが 3 分で終わらなかった)`)
 })
 
 for (const send of ['refuse', 'throw'] as const) {
@@ -472,7 +527,7 @@ for (const send of ['refuse', 'throw'] as const) {
     await start($)
     const r = await probe($, { questions: ['x'] })
     expect(w.sends.length).toBe(1)
-    expect(r.result).toBe(`${longText(2000)}\n…(切り詰め。元は 2600 文字)`)
+    expect(bare(r.result)).toBe(`${longText(2000)}\n…(切り詰め。元は 2600 文字)`)
     expect(w.spawns.length).toBe(1)
   })
 }
@@ -483,8 +538,8 @@ for (const [name, then] of [['an error', { answer: 'half', reason: 'error' }], [
     await start($)
     const r = await probe($, { questions: ['x'] })
     expect(w.sends.length).toBe(1)
-    expect(r.result).toBe(`${longText(2000)}\n…(切り詰め。元は 2300 文字)`)
-    expect(r.deny).toBe(undefined)
+    expect(bare(r.result)).toBe(`${longText(2000)}\n…(切り詰め。元は 2300 文字)`)
+    expect(bare(r.deny)).toBe(undefined)
   })
 }
 
@@ -494,7 +549,7 @@ test('rewrite: a failed task is not sent back, and an error with a long partial 
   const r = await probe($, { questions: ['ok', 'err'] })
   expect(w.sends.length).toBe(0)
   const partial = 'ERROR: エラーで終了した\n' + longText(5000)
-  expect(r.result).toBe(`## 1\nfine\n\n## 2\n${partial.slice(0, 2000)}\n…(切り詰め。元は ${partial.length} 文字)`)
+  expect(bare(r.result)).toBe(`## 1\nfine\n\n## 2\n${partial.slice(0, 2000)}\n…(切り詰め。元は ${partial.length} 文字)`)
 })
 
 test('rewrite: the hand-backs and notifications of a rewritten subagent are dropped like the first ones', async ($, on) => {
@@ -511,7 +566,7 @@ test('rewrite: the hand-backs and notifications of a rewritten subagent are drop
     seen.others.push(await peer($, handback('someone-else')))
   })
   const r = await probe($, { questions: ['x'] })
-  expect(r.result).toBe('short')
+  expect(bare(r.result)).toBe('short')
   expect(w.sends.length).toBe(1)
   expect(seen.handbacks.length).toBeGreaterThan(3) // both runs
   for (const h of seen.handbacks) expect(h.drop).toContain('hand-back')
@@ -550,7 +605,7 @@ test('rewrite: resuming a subagent asks agent.offer, so the probe type is offere
   const seen: Array<[number, boolean]> = []
   w.onPark.push(async () => { seen.push([w.sends.length, (await $.agent.offer(offerInput(AGENT))).isOffered]) })
   const r = await probe($, { questions: ['x'] })
-  expect(r.result).toBe('short') // the mock refuses a send while the type is hidden: it was delivered, so the window was open
+  expect(bare(r.result)).toBe('short') // the mock refuses a send while the type is hidden: it was delivered, so the window was open
   expect(w.sends.length).toBe(1)
   expect(seen.length).toBeGreaterThan(3)
   for (const [sent, offered] of seen) expect(offered).toBe(sent === 1)
@@ -568,12 +623,12 @@ test('rewrite: with several rewrites out the type stays offered until the last o
   const seen: Array<[number, boolean]> = []
   w.onPark.push(async () => { seen.push([w.sends.length, (await $.agent.offer(offerInput(AGENT))).isOffered]) })
   const r = await probe($, { questions: ['a', 'b'] })
-  expect(r.result).toBe('## 1\na-short\n\n## 2\nb-short')
+  expect(bare(r.result)).toBe('## 1\na-short\n\n## 2\nb-short')
   for (const [sent, offered] of seen) expect(offered).toBe(sent > 0)
   expect((await $.agent.offer(offerInput(AGENT))).isOffered).toBe(false)
   // and the next call starts from nothing
   const again = await probe($, { questions: ['c'] })
-  expect(again.result).toBe('answer: c')
+  expect(bare(again.result)).toBe('answer: c')
   expect((await $.agent.offer(offerInput(AGENT))).isOffered).toBe(false)
 })
 
@@ -588,7 +643,7 @@ test('fallback: when the rewrite cannot be asked for, one tool-less completion s
   const w = world($, on, { send: 'refuse', shorten: 'ok', script: () => ({ answer: longText(2600) }) })
   await start($)
   const r = await probe($, { questions: ['調べて: foo'], max_chars: 500 })
-  expect(r.result).toBe('要約: ' + 'k'.repeat(100) + '\n…(要約。元は 2600 文字)')
+  expect(bare(r.result)).toBe('要約: ' + 'k'.repeat(100) + '\n…(要約。元は 2600 文字)')
   expect(w.spawns.length).toBe(1)
   expect(w.completes.length).toBe(1)
   const req = w.completes[0]
@@ -609,7 +664,7 @@ test('fallback: also when the rewrite ran into an error, and for every answer al
   })
   await start($)
   const r = await probe($, { questions: ['a', 'b', 'c'] })
-  expect(r.result).toBe(`## 1\n要約: ${'k'.repeat(100)}\n…(要約。元は 2300 文字)\n\n## 2\nfine\n\n## 3\nshort now`)
+  expect(bare(r.result)).toBe(`## 1\n要約: ${'k'.repeat(100)}\n…(要約。元は 2300 文字)\n\n## 2\nfine\n\n## 3\nshort now`)
   expect(w.completes.length).toBe(1)
 })
 
@@ -618,7 +673,7 @@ test('fallback: a rewrite that gets stuck is shortened too', async ($, on) => {
   await start($)
   const r = await probe($, { questions: ['x'] })
   expect(w.stopped).toEqual(['agent-1'])
-  expect(r.result).toBe(`要約: ${'k'.repeat(100)}\n…(要約。元は 2500 文字)`)
+  expect(bare(r.result)).toBe(`要約: ${'k'.repeat(100)}\n…(要約。元は 2500 文字)`)
 })
 
 for (const shorten of ['none', 'long', 'throw'] as const) {
@@ -627,7 +682,7 @@ for (const shorten of ['none', 'long', 'throw'] as const) {
     await start($)
     const r = await probe($, { questions: ['x'] })
     expect(w.completes.length).toBe(1)
-    expect(r.result).toBe(`${longText(2000)}\n…(切り詰め。元は 2600 文字)`)
+    expect(bare(r.result)).toBe(`${longText(2000)}\n…(切り詰め。元は 2600 文字)`)
   })
 }
 
@@ -638,7 +693,7 @@ test('fallback: not used when the rewrite works, nor after two rewrites that sta
   })
   await start($)
   const r = await probe($, { questions: ['a', 'b'] })
-  expect(r.result).toBe(`## 1\nshort\n\n## 2\n${longText(2000, 'y')}\n…(切り詰め。元は 2300 文字)`)
+  expect(bare(r.result)).toBe(`## 1\nshort\n\n## 2\n${longText(2000, 'y')}\n…(切り詰め。元は 2300 文字)`)
   expect(w.completes.length).toBe(0)
 })
 
@@ -713,10 +768,10 @@ test('context: the instruction to the children says when to read it, and names t
 test('context: only text of user and assistant, no tool output, no system-reminder, oldest first, with headings', async ($, on) => {
   const w = world($, on, { messages: CONVERSATION })
   const r = await askContext($, w, { last: 50 })
-  expect(r.result).toBe(['### user\nfoo を直して', '### assistant\n見てみる', '### assistant\nbar.ts にある', '### user\nBar の方も見て', '### assistant\nどちらも直した'].join('\n\n'))
-  expect(r.result).not.toContain('TOOL-OUTPUT-LS')
-  expect(r.result).not.toContain('REMINDER-SECRET')
-  expect(r.result).not.toContain('only a reminder')
+  expect(bare(r.result)).toBe(['### user\nfoo を直して', '### assistant\n見てみる', '### assistant\nbar.ts にある', '### user\nBar の方も見て', '### assistant\nどちらも直した'].join('\n\n'))
+  expect(bare(r.result)).not.toContain('TOOL-OUTPUT-LS')
+  expect(bare(r.result)).not.toContain('REMINDER-SECRET')
+  expect(bare(r.result)).not.toContain('only a reminder')
   expect(w.messageCalls.length).toBe(1)
   expect(w.messageCalls[0].agentId).toBeUndefined() // the main conversation
   expect(bodyOf('a<system-reminder>x</system-reminder>b <system-reminder>\ny\n</system-reminder>')).toBe('ab')
@@ -726,26 +781,26 @@ test('context: last defaults to 5 and counts from the newest', async ($, on) => 
   const many = Array.from({ length: 8 }, (_, i) => turn(i % 2 ? 'assistant' : 'user', `message ${i}`))
   const w = world($, on, { messages: many })
   const r = await askContext($, w, {})
-  expect(r.result).toBe([3, 4, 5, 6, 7].map((i) => `### ${i % 2 ? 'assistant' : 'user'}\nmessage ${i}`).join('\n\n'))
+  expect(bare(r.result)).toBe([3, 4, 5, 6, 7].map((i) => `### ${i % 2 ? 'assistant' : 'user'}\nmessage ${i}`).join('\n\n'))
   const two = await asAgent($, 'agent-1', { tool: CONTEXT, last: 2 })
-  expect(two.result).toBe('### user\nmessage 6\n\n### assistant\nmessage 7')
+  expect(bare(two.result)).toBe('### user\nmessage 6\n\n### assistant\nmessage 7')
 })
 
 test('context: grep keeps the messages that match (regular expression, else substring; case does not matter), then last counts among them', async ($, on) => {
   const w = world($, on, { messages: CONVERSATION })
   const re = await askContext($, w, { grep: 'bar|foo', last: 50 })
-  expect(re.result).toBe(['### user\nfoo を直して', '### assistant\nbar.ts にある', '### user\nBar の方も見て'].join('\n\n'))
+  expect(bare(re.result)).toBe(['### user\nfoo を直して', '### assistant\nbar.ts にある', '### user\nBar の方も見て'].join('\n\n'))
   const newest = await asAgent($, 'agent-1', { tool: CONTEXT, grep: 'bar', last: 1 })
-  expect(newest.result).toBe('### user\nBar の方も見て')
+  expect(bare(newest.result)).toBe('### user\nBar の方も見て')
   const literal = await asAgent($, 'agent-1', { tool: CONTEXT, grep: 'bar.ts (' }) // not a regular expression
-  expect(literal.result).toBe('（該当する発言がない）')
+  expect(bare(literal.result)).toBe('（該当する発言がない）')
   const dotted = await asAgent($, 'agent-1', { tool: CONTEXT, grep: '.ts にある' })
-  expect(dotted.result).toBe('### assistant\nbar.ts にある')
+  expect(bare(dotted.result)).toBe('### assistant\nbar.ts にある')
   const none = await asAgent($, 'agent-1', { tool: CONTEXT, grep: 'nothing like this' })
-  expect(none.result).toBe('（該当する発言がない）')
+  expect(bare(none.result)).toBe('（該当する発言がない）')
   // tool output is not searched
   const tool = await asAgent($, 'agent-1', { tool: CONTEXT, grep: 'TOOL-OUTPUT' })
-  expect(tool.result).toBe('（該当する発言がない）')
+  expect(bare(tool.result)).toBe('（該当する発言がない）')
 })
 
 test('context: above max_chars the oldest are left out and the cut is marked; the newest stay', () => {
@@ -771,7 +826,7 @@ test('context: the defaults are 3000 characters and the cap is 8000', async ($, 
   const w = world($, on, { messages: msgs })
   const dflt = await askContext($, w, { last: 50 })
   expect(lengthOf(dflt.result)).toBeLessThanOrEqual(3000)
-  expect(dflt.result).toContain('…（上限のため、古い発言')
+  expect(bare(dflt.result)).toContain('…（上限のため、古い発言')
   expect(dflt.result.endsWith('9'.repeat(1000))).toBe(true) // the newest
   const wide = await asAgent($, 'agent-1', { tool: CONTEXT, last: 50, max_chars: 8000 })
   expect(lengthOf(wide.result)).toBeLessThanOrEqual(8000)
@@ -798,10 +853,10 @@ test('context: refused for the parent and for anything that is not a probe child
   await probe($, { questions: ['q'] })
   w.messageCalls.length = 0
   const main = await asAgent($, undefined, { tool: CONTEXT })
-  expect(main.deny).toContain('probe の内側からだけ')
-  expect(main.result).toBe(undefined)
+  expect(bare(main.deny)).toContain('probe の内側からだけ')
+  expect(bare(main.result)).toBe(undefined)
   const other = await asAgent($, 'general-purpose-1', { tool: CONTEXT, last: 3 })
-  expect(other.deny).toContain('probe の内側からだけ')
+  expect(bare(other.deny)).toContain('probe の内側からだけ')
   expect(w.messageCalls.length).toBe(0)
   // a probe child is let in
   const ok = await asAgent($, 'agent-1', { tool: CONTEXT })
@@ -822,7 +877,7 @@ test('context: bad input is refused before the conversation is read', async ($, 
   for (const input of bad) expect(typeof (await asAgent($, 'agent-1', { tool: CONTEXT, ...input })).deny).toBe('string')
   expect(w.messageCalls.length).toBe(0)
   for (const input of [{ last: 1 }, { last: 50 }, { max_chars: 200 }, { max_chars: 8000 }, { grep: 'x'.repeat(200) }]) {
-    expect((await asAgent($, 'agent-1', { tool: CONTEXT, ...input })).deny).toBe(undefined)
+    expect(bare((await asAgent($, 'agent-1', { tool: CONTEXT, ...input })).deny)).toBe(undefined)
   }
 })
 
@@ -830,7 +885,7 @@ for (const messages of ['deny', 'throw'] as const) {
   test(`context: a conversation that cannot be read (${messages}) is a refusal, not a crash`, async ($, on) => {
     const w = world($, on, { messages })
     const r = await askContext($, w, {})
-    expect(r.result).toBe(undefined)
+    expect(bare(r.result)).toBe(undefined)
     expect(typeof r.deny).toBe('string')
     expect(w.messageCalls.length).toBe(1)
   })
@@ -839,7 +894,7 @@ for (const messages of ['deny', 'throw'] as const) {
 test('context: a conversation with no text says so', async ($, on) => {
   const w = world($, on, { messages: [turn('user', '<system-reminder>x</system-reminder>'), turn('assistant', '', { toolUses: [{ tool_use_id: 't', tool: 'Bash', input: {} }] })] })
   const r = await askContext($, w, {})
-  expect(r.result).toBe('（本文のある発言がない）')
+  expect(bare(r.result)).toBe('（本文のある発言がない）')
 })
 
 // ------------------------------------------------------------------ the background in the question
@@ -903,7 +958,7 @@ test('background: a conversation that throws gives no background and the probe g
   const w = world($, on, { messages: 'throw' })
   await start($)
   const r = await probe($, { questions: ['q'] })
-  expect(r.result).toBe('answer: q')
+  expect(bare(r.result)).toBe('answer: q')
   expect(w.spawns[0].prompt).toBe('q\n\n（結果の上限: 2000 字）')
 })
 
@@ -911,7 +966,7 @@ test('background: a conversation that is denied or empty gives no background eit
   const w = world($, on, { messages: 'deny' })
   await start($)
   const r = await probe($, { questions: ['q'] })
-  expect(r.result).toBe('answer: q')
+  expect(bare(r.result)).toBe('answer: q')
   expect(w.spawns[0].prompt).toBe('q\n\n（結果の上限: 2000 字）')
   expect(recentExchange([])).toBe(undefined)
   expect(recentExchange([A('only assistant')])).toBe(undefined)
@@ -994,12 +1049,12 @@ test('background: context: false sends the questions alone, and that call\'s chi
   expect(w.spawns[0].prompt).toBe('foo はどこ？\n\n（結果の上限: 2000 字）')
   expect(w.messageCalls.length).toBe(0)
   const refused = await asAgent($, 'agent-1', { tool: CONTEXT })
-  expect(refused.deny).toContain('context: false')
+  expect(bare(refused.deny)).toContain('context: false')
   expect(w.messageCalls.length).toBe(0)
   await probe($, { questions: ['bar は？'] }) // the next call has it again
   expect(w.spawns.at(-1).prompt.startsWith('## 背景（依頼主との直近の会話）')).toBe(true)
   expect(typeof (await asAgent($, 'agent-2', { tool: CONTEXT })).result).toBe('string')
-  expect((await probe($, { questions: ['q'], context: 'no' })).deny).toMatch(/context は true か false/)
+  expect(bare((await probe($, { questions: ['q'], context: 'no' })).deny)).toMatch(/context は true か false/)
 })
 
 test('effort: a call\'s effort goes on each model request of its children, and theirs only', async ($, on) => {
@@ -1017,7 +1072,7 @@ test('effort: a call\'s effort goes on each model request of its children, and t
   for (const id of ['agent-1', 'agent-2', undefined]) await step(id)
   expect(steps).toEqual(['max', 'medium', 'medium']) // the max call's child, a default call's child (the engine's), main
   expect(w.spawns.length).toBe(2)
-  expect((await probe($, { questions: ['q'], effort: 'extreme' })).deny).toMatch(/effort は low, medium, high, xhigh, max のどれか/)
+  expect(bare((await probe($, { questions: ['q'], effort: 'extreme' })).deny)).toMatch(/effort は low, medium, high, xhigh, max のどれか/)
 })
 test('usage: the probe subagents\' own spawns are left as they were (their prompt carries the section like any other)', async ($, on) => {
   const w = world($, on)
@@ -1032,7 +1087,7 @@ test('usage: a file that cannot be read, or is empty, leaves the section as it w
   for (let i = 0; i < 2; i++) expect(await rules($)).toBe('MODEL')
   expect(w.reads.length).toBe(1) // not asked again within the session
   // and the probe tool still works
-  expect((await probe($, { questions: ['q'] })).result).toBe('answer: q')
+  expect(bare((await probe($, { questions: ['q'] })).result)).toBe('answer: q')
 })
 
 test('usage: an empty file adds nothing', async ($, on) => {
@@ -1149,7 +1204,7 @@ test('PROBE_SANDBOX=off: Bash of a probe subagent runs as is, and bwrap is not n
   await start($)
   const command = `echo 'it''s' > /root/x; ls "$HOME" | head -3`
   const r = await asAgent($, 'p1', { tool: 'Bash', command })
-  expect(r.deny).toBeUndefined()
+  expect(bare(r.deny)).toBeUndefined()
   expect(w.bash).toEqual([command])
   expect(w.ran.some((argv) => argv[0] === 'bwrap')).toBe(false)
   // others are untouched, as before
@@ -1163,13 +1218,13 @@ test('PROBE_SANDBOX=off: the probe tool starts without bwrap, the rest of the ga
   const w = world($, on, { bwrap: false, agents: [{ id: 'p1', type: AGENT, status: 'running', description: 'probe' }] })
   await start($)
   const r = await probe($, { questions: ['a'] })
-  expect(r.deny).toBeUndefined()
+  expect(bare(r.deny)).toBeUndefined()
   expect(w.spawns.length).toBe(1)
   expect(w.ran.some((argv) => argv[0] === 'bwrap')).toBe(false)
   // writes by the file tools and background Bash are still refused
-  expect((await asAgent($, 'p1', { tool: 'Edit', file_path: '/x', old_string: 'a', new_string: 'b' })).deny).toContain('読み取り専用')
-  expect((await asAgent($, 'p1', { tool: 'Write', file_path: '/x', content: 'c' })).deny).toContain('読み取り専用')
-  expect((await asAgent($, 'p1', { tool: 'Bash', command: 'sleep 100', run_in_background: true })).deny).toContain('run_in_background')
+  expect(bare((await asAgent($, 'p1', { tool: 'Edit', file_path: '/x', old_string: 'a', new_string: 'b' })).deny)).toContain('読み取り専用')
+  expect(bare((await asAgent($, 'p1', { tool: 'Write', file_path: '/x', content: 'c' })).deny)).toContain('読み取り専用')
+  expect(bare((await asAgent($, 'p1', { tool: 'Bash', command: 'sleep 100', run_in_background: true })).deny)).toContain('run_in_background')
   expect(w.bash).toEqual([])
 })
 
@@ -1200,7 +1255,7 @@ test('background Bash of a probe subagent is refused', async ($, on) => {
   const w = world($, on, { agents: [{ id: 'p1', type: AGENT, status: 'running', description: 'probe' }] })
   await start($)
   const r = await asAgent($, 'p1', { tool: 'Bash', command: 'sleep 100', run_in_background: true })
-  expect(r.deny).toContain('run_in_background')
+  expect(bare(r.deny)).toContain('run_in_background')
   expect(w.bash).toEqual([])
 })
 
@@ -1214,9 +1269,9 @@ test('Edit, Write and NotebookEdit of a probe subagent are refused, others pass'
   ]
   for (const c of calls) {
     const r = await asAgent($, 'p1', c)
-    expect(r.deny).toContain('読み取り専用')
+    expect(bare(r.deny)).toContain('読み取り専用')
     const ok = await asAgent($, 'o1', c)
-    expect(ok.deny).toBe(undefined)
+    expect(bare(ok.deny)).toBe(undefined)
   }
   expect(w.calls).toEqual(['Edit', 'Write', 'NotebookEdit'])
   expect(w.bash).toEqual([])
@@ -1239,17 +1294,17 @@ test('if the gate itself throws during a probe run, an unclassified subagent is 
   await start($)
   // outside a run: fail open for a subagent we know nothing about
   const idle = await asAgent($, 'stranger', { tool: 'Bash', command: 'ls' })
-  expect(idle.deny).toBe(undefined)
+  expect(bare(idle.deny)).toBe(undefined)
   expect(w.bash).toEqual(['ls'])
   // inside a run: fail closed
   let during: any
   w.onPark.push(async () => { if (during === undefined) during = await asAgent($, 'stranger', { tool: 'Edit', file_path: '/x', old_string: 'a', new_string: 'b' }) })
   await probe($, { questions: ['a'] })
-  expect(during.deny).toContain('実行しない')
+  expect(bare(during.deny)).toContain('実行しない')
   let duringBash: any
   w.onPark.push(async () => { if (duringBash === undefined) duringBash = await asAgent($, 'stranger', { tool: 'Bash', command: 'rm -rf x' }) })
   await probe($, { questions: ['b'] })
-  expect(duringBash.deny).toContain('実行しない')
+  expect(bare(duringBash.deny)).toContain('実行しない')
   expect(w.bash).toEqual(['ls'])
 })
 
@@ -1312,7 +1367,7 @@ test('dropping the hand-back leaves the answer: turn.complete still gives the to
     seen.push(await peer($, handback('someone-else')))
   })
   const r = await probe($, { questions: ['a'] })
-  expect(r.result).toBe('answer: a')
+  expect(bare(r.result)).toBe('answer: a')
   expect(seen[0].drop).toContain('hand-back')
   expect(seen[1].text).toContain('someone-else')
 })
@@ -1367,7 +1422,7 @@ test('the attachment hook failing lets the report through; the answer of the too
   const seen: any[] = []
   w.onPark.push(async () => { seen.push(await attach($, reminder(agentMessage('agent-1', 'answer: a')))) })
   const r = await probe($, { questions: ['a'] })
-  expect(r.result).toBe('answer: a')
+  expect(bare(r.result)).toBe('answer: a')
   expect(seen[0].text).toBe(null) // agent-1 is known from the spawn: no list needed
   const text = reminder(agentMessage('stranger'))
   expect((await attach($, text)).text).toBe(text) // unknown sender and the list is down: through
@@ -1473,10 +1528,10 @@ test('the tool reads like a shell, not a delegate: no word for agents or tasks i
 test('a single answer comes back as bare text, two or more get numbered headings; the old tasks key is refused', async ($, on) => {
   const w = world($, on)
   await start($)
-  expect((await probe($, { questions: ['one'] })).result).toBe('answer: one')
-  expect((await probe($, { questions: ['one', 'two'] })).result).toBe('## 1\nanswer: one\n\n## 2\nanswer: two')
+  expect(bare((await probe($, { questions: ['one'] })).result)).toBe('answer: one')
+  expect(bare((await probe($, { questions: ['one', 'two'] })).result)).toBe('## 1\nanswer: one\n\n## 2\nanswer: two')
   const old = await probe($, { tasks: ['one'] })
-  expect(old.deny).toContain('questions')
+  expect(bare(old.deny)).toContain('questions')
   expect(w.spawns.length).toBe(3)
 })
 
@@ -1502,6 +1557,60 @@ test('formatResults numbers sections, caps long answers, writes no path lines', 
   expect(formatResults([{ ok: true, text: 'abc', note: '…(要約。元は 900 文字)' }], 500)).toBe('abc\n…(要約。元は 900 文字)')
   expect(shortenPrompt('Q', 'A'.repeat(3), 3, 500)).toBe(['次は調べものの依頼と、その答えである。答えが長すぎるので、500 字以内に書き直す。', '結論を先に書く。数値・名前・ファイル:行・原文の引用など必要な情報だけ残し、経過・前置き・注意書きは削る。答えにないことは書かない。日本語で、書き直した結果だけを返す。', '', '【依頼】', 'Q', '', '【答え（3 字）】', 'AAA'].join('\n'))
   expect(rewriteRequest(2500, 2000)).toBe('結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。')
+})
+
+test('scope: every tool call of a probe subagent, as the model wrote it, is listed under its answer; errors marked', async ($, on) => {
+  const use = (tool: string, input: any, extra: any = {}) => ({ tool_use_id: 'u', tool, input, text: 'ok', ...extra })
+  world($, on, {
+    script: () => ({ answer: 'done' }),
+    childMessages: {
+      'agent-1': [
+        { role: 'user', text: 'q', toolUses: [] },
+        { role: 'assistant', text: '', toolUses: [use('Bash', { command: 'grep -rn foo src\necho more' }), use('Bash', { command: 'grep -rn foo src\necho more' })] },
+        { role: 'assistant', text: '', toolUses: [use('Read', { file_path: '/p/a.ts', offset: 10, limit: 5 }), use('WebSearch', { query: 'bwrap unshare-net' })] },
+        { role: 'assistant', text: '', toolUses: [use(CONTEXT, { grep: 'x' }), use('Edit', { file_path: '/p/a.ts', old_string: 'a', new_string: 'b' }, { isError: true })] },
+        { role: 'assistant', text: '', toolUses: [use('Bash', { command: 'ls' }, { isError: true, text: WRAPUP_DENY }), use('SubagentHandback', { message: 'done' })] },
+      ],
+    },
+  })
+  await start($)
+  const r = await probe($, { questions: ['x'] })
+  expect(r.result).toBe([
+    'done',
+    '',
+    '調べた範囲（呼び出し 6 回）：',
+    '- Bash: grep -rn foo src（2回）',
+    '- Read: /p/a.ts:10-14',
+    '- WebSearch: bwrap unshare-net',
+    `- ${CONTEXT}: {"grep":"x"}`,
+    '- Edit: {"file_path":"/p/a.ts","old_string":"a","new_string":"b"}（エラー）',
+  ].join('\n'))
+})
+
+test('scope: an answer without tool calls still gets its list, an unreadable transcript says so, a question that never started has none', async ($, on) => {
+  world($, on, { script: (p) => (p === 'bad' ? { deny: 'nope' } : { answer: 'from the background alone' }), childMessages: { 'agent-3': 'throw' } })
+  await start($)
+  const r = await probe($, { questions: ['ok', 'bad', 'lost'] })
+  expect(r.result).toBe(
+    '## 1\nfrom the background alone\n\n調べた範囲（呼び出し 0 回）：ツールは使っていない。\n\n' +
+      '## 2\nERROR: 開始できなかった: nope\n\n' +
+      '## 3\nfrom the background alone\n\n調べた範囲：子の記録を読めなかった。',
+  )
+})
+
+test('callLine and scopeText', () => {
+  expect(callLine({ tool: 'Grep', pattern: 'a|b', path: '/s', glob: '*.ts' })).toBe('Grep: "a|b" in /s (*.ts)')
+  expect(callLine({ tool: 'Glob', pattern: '**/*.md' })).toBe('Glob: **/*.md in .')
+  expect(callLine({ tool: 'Read', file_path: '/f', limit: 3 })).toBe('Read: /f:1-3')
+  expect(callLine({ tool: 'WebFetch', url: 'https://e.x/a' })).toBe('WebFetch: https://e.x/a')
+  expect(Array.from(callLine({ tool: 'Bash', command: 'x'.repeat(200) })).length).toBe(80)
+  expect(scopeText([])).toBe('調べた範囲（呼び出し 0 回）：ツールは使っていない。')
+  expect(scopeText(['Bash: a', 'Read: /f', 'Bash: a'])).toBe('調べた範囲（呼び出し 3 回）：\n- Bash: a（2回）\n- Read: /f')
+  const many = [...Array.from({ length: 18 }, (_, i) => `Bash: c${i}`), 'Bash: c17']
+  const t = scopeText(many)
+  expect(t.split('\n')[0]).toBe('調べた範囲（呼び出し 19 回）：')
+  expect(t.split('\n').length).toBe(1 + 15 + 1)
+  expect(t.endsWith('- ほか 3 種類（4回）')).toBe(true)
 })
 
 test('stopSeconds: 5 s before the Bash call\'s own timeout (its timeout, else the default; 10 minutes at most)', () => {

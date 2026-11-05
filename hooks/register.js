@@ -78,6 +78,10 @@ const MAX_MAX_CHARS = 8000
 const MAX_REVISIONS = 2
 const REWRITE_TIMEOUT_MS = 3 * 60 * 1000
 const SHORTEN_TIMEOUT_MS = 60 * 1000
+const WRAPUP_TIMEOUT_MS = 2 * 60 * 1000 // a question past its time is asked for what it found so far, and waited for this long
+const SCOPE_MAX_LINES = 15
+const SCOPE_LINE_CHARS = 80
+const HANDBACK_TOOL = 'SubagentHandback' // how a subagent hands its answer back: neither refused nor listed
 const COMPLETIONS_CAP = 256
 const CHILD_MODEL = 'haiku' // probe always runs on haiku
 
@@ -110,7 +114,7 @@ export const AGENT_PROMPT = [
   `スクリプトはファイルに書かず、python3 - <<'EOF' のように標準入力で渡す。一時ファイルは mktemp で作れるが、そのコマンドが終わると消えるので、同じコマンドの中で使い切る。各 Bash 呼び出しは独立で、cd や環境変数は残らない。`,
   '「## 背景」は参考にする。足りなければ context ツールで依頼主の会話を必要な分だけ読む。',
   `最後のメッセージがそのまま返る。結論を先に、既定では ${DEFAULT_MAX_CHARS} 字以内で書く。依頼の末尾に「結果の上限: N 字」とあれば N 字が上限。長さや形の指定があればそれに従う。前置き・経過・使ったコマンド・注意書きは書かない。`,
-  '依頼主は答えを確かめずに使うので、確かめていない推測には「推測」と書く。見つからなかったときは、そう書いて、探した場所と検索語を1行で添える。',
+  '依頼主は答えを確かめずに使うので、確かめていない推測には「推測」と書く。見つからなかったときは、そう書く。',
   '失敗したことや分からなかったことはそのまま書く。日本語で書く。',
 ].join('')
 
@@ -130,7 +134,7 @@ export const TOOL_SPEC = {
     '読み取り専用のシェルで調べて、結論か関係する原文の引用だけを返す。ファイルの検索、コマンドやテストの実行、Web 検索ができ、条件を明示すれば分岐を含む手順も任せられる。' +
     '向くのは、どこにあるか分からないものを広く探すとき、多くのファイルにまたがるとき、長い出力（ログ、コマンドの出力）から要点だけ欲しいとき、Web で調べるとき。これから編集する箇所と、すぐ済む確認は自分でやる。' +
     '判断は、基準を問いに書けるなら任せられる。会話全体の文脈や好みに依る判断は任せず、材料集めに使う。' +
-    '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれ、見つからなかったときは探した範囲が書かれる。',
+    '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれる。答えの後ろには、調べた範囲（使ったツールの一覧）が付く。',
   inputSchema: {
     type: 'object',
     properties: {
@@ -184,6 +188,7 @@ export const CONTEXT_SPEC = {
 const CONTEXT_DENY = 'context は probe の内側からだけ使える。'
 const CONTEXT_OFF_DENY = 'この probe は会話を渡さない指定（context: false）で呼ばれた。質問だけで答える。'
 const READONLY_DENY = 'probe は読み取り専用で、ファイルを変更できない。書き込みが必要な作業は親に戻す。'
+const GATE_FAIL_DENY = 'probe の読み取り専用の確認に失敗したため、この呼び出しは実行しない。'
 const SANDBOXED_ALLOW = 'probe のサンドボックスの中（ファイルは読み取り専用、ネットワークなし）で実行する。'
 const NO_SANDBOX_DENY = 'この環境には probe の Bash を読み取り専用で包む仕組み（bwrap、sandbox-exec、srt）がない。読み取り専用と判定できるコマンドだけ実行できる。'
 
@@ -254,6 +259,94 @@ export function rewriteRequest(n, max) {
   return `結果が ${n} 字で、上限 ${max} 字を超えた。結論を先に、${max} 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。`
 }
 
+/** What a subagent past its time is asked for: its answer so far, by the usual rules, with no more lookups. */
+export function wrapupRequest(minutes, max) {
+  return `時間切れ（${minutes} 分）。これ以上は調べない（道具は断られる）。ここまでで分かったことを、ふつうの答えと同じ決まりで、結論を先に ${max} 字以内で書く。時間内に調べきれなかったことは、分からなかったこととして書く。書いた答えだけを最後のメッセージに書く。`
+}
+
+export const WRAPUP_DENY = 'probe の時間切れのため、道具は使えない。ここまでで分かったことを答えとして書き、最後のメッセージにする。'
+
+/** One line of the scope list for a tool call of a subagent (`e` as tool.call has it). */
+export function callLine(e) {
+  const str = (k) => (typeof e[k] === 'string' ? e[k] : '')
+  let what
+  switch (e.tool) {
+    case 'Bash':
+      what = str('command').trim().split('\n')[0]
+      break
+    case 'Read': {
+      const from = typeof e.offset === 'number' ? e.offset : 1
+      what = str('file_path') + (typeof e.limit === 'number' ? `:${from}-${from + e.limit - 1}` : typeof e.offset === 'number' ? `:${from}-` : '')
+      break
+    }
+    case 'Grep':
+      what = `"${str('pattern')}" in ${str('path') || '.'}${str('glob') ? ` (${str('glob')})` : ''}`
+      break
+    case 'Glob':
+      what = `${str('pattern')} in ${str('path') || '.'}`
+      break
+    case 'WebSearch':
+      what = str('query')
+      break
+    case 'WebFetch':
+      what = str('url')
+      break
+    default: {
+      const { tool, tool_use_id, agentId, requestMeta, consent, ...input } = e
+      what = JSON.stringify(input)
+    }
+  }
+  const line = `${e.tool}: ${what}`
+  const chars = Array.from(line)
+  return chars.length <= SCOPE_LINE_CHARS ? line : chars.slice(0, SCOPE_LINE_CHARS - 1).join('') + '…'
+}
+
+/** Whether `e` (a tool call) comes from a probe subagent past its time, and is not the hand-back. */
+function wrappingUp(e) {
+  return e.agentId !== undefined && e.tool !== HANDBACK_TOOL && childCalls.get(e.agentId)?.wrapping === true
+}
+
+/**
+ * The scope list of a subagent, from its transcript: each tool call as the model wrote it (before the
+ * sandbox wrapped it), marked when it ended in an error; not the hand-back, nor what the wrap-up refused.
+ */
+async function scopeOf($, agentId) {
+  try {
+    const messages = await $.session.messages({ agentId })
+    if (!Array.isArray(messages)) return SCOPE_UNREAD
+    const lines = []
+    for (const m of messages) {
+      for (const u of (m && m.toolUses) || []) {
+        if (!u || u.tool === HANDBACK_TOOL || u.text === WRAPUP_DENY) continue
+        const input = u.input && typeof u.input === 'object' ? u.input : {}
+        lines.push(callLine({ ...input, tool: u.tool }) + (u.isError ? '（エラー）' : ''))
+      }
+    }
+    return scopeText(lines)
+  } catch {
+    return SCOPE_UNREAD
+  }
+}
+
+/**
+ * The scope list after an answer, always there (an answer could claim lookups it never made): the
+ * subagent's tool calls, each distinct one once with how many times it ran, at most SCOPE_MAX_LINES.
+ */
+export function scopeText(lines) {
+  const all = lines || []
+  if (all.length === 0) return '調べた範囲（呼び出し 0 回）：ツールは使っていない。'
+  const counts = new Map()
+  for (const l of all) counts.set(l, (counts.get(l) || 0) + 1)
+  const entries = [...counts]
+  const line = ([l, n]) => `- ${l}${n > 1 ? `（${n}回）` : ''}`
+  const shown = entries.slice(0, SCOPE_MAX_LINES).map(line)
+  const rest = entries.slice(SCOPE_MAX_LINES)
+  if (rest.length > 0) shown.push(`- ほか ${rest.length} 種類（${rest.reduce((a, [, n]) => a + n, 0)}回）`)
+  return `調べた範囲（呼び出し ${all.length} 回）：\n${shown.join('\n')}`
+}
+
+export const SCOPE_UNREAD = '調べた範囲：子の記録を読めなかった。'
+
 /** The text itself when it fits in `max` characters, else its first `max` characters and a mark. */
 function fit(text, max, why) {
   const chars = Array.from(String(text))
@@ -266,7 +359,7 @@ function fit(text, max, why) {
  * question order. No file path lines. An answer above `maxChars` is cut (marked).
  */
 export function formatResults(results, maxChars = DEFAULT_MAX_CHARS) {
-  const body = (r) => fit(r ? r.text : 'ERROR: 結果なし', maxChars, r && r.why) + (r && r.note ? '\n' + r.note : '')
+  const body = (r) => fit(r ? r.text : 'ERROR: 結果なし', maxChars, r && r.why) + (r && r.note ? '\n' + r.note : '') + (r && r.scope ? '\n\n' + r.scope : '')
   if (results.length === 1) return body(results[0])
   return results.map((r, i) => `## ${i + 1}\n${body(r)}`).join('\n\n')
 }
@@ -616,18 +709,27 @@ async function stopAgent($, agentId) {
  * closeWindow when the rewrite is over) and shuts at once when not. The outcome goes to the trace.
  */
 async function askRewrite($, agentId, n, max) {
+  return askAgain($, agentId, rewriteRequest(n, max), { hook: 'rewrite', length: n, max })
+}
+
+/** Asks the (still running) subagent past its time for its answer so far; whether it was delivered. */
+async function askWrapup($, agentId, minutes, max) {
+  return askAgain($, agentId, wrapupRequest(minutes, max), { hook: 'wrapup', max })
+}
+
+async function askAgain($, agentId, text, info) {
   let delivered = false
   let reason
   offerWindow++
   try {
-    const r = await $.session.send({ to: { agentId }, text: rewriteRequest(n, max) })
+    const r = await $.session.send({ to: { agentId }, text })
     delivered = r.isDelivered === true
     if (!delivered) reason = r.reason
   } catch (err) {
     reason = `threw: ${err}`
   }
   if (!delivered) offerWindow--
-  await traceLine($, { hook: 'rewrite', agentId, delivered, reason, length: n, max })
+  await traceLine($, { ...info, agentId, delivered, reason })
   return delivered
 }
 
@@ -741,6 +843,7 @@ const MODE_SETTING = { command: MODE_COMMAND, key: MODE_KEY, values: MODES, get 
 /** The conversation of whoever called probe, for the probe subagent that asks. */
 async function readContext($, e) {
   if (e.agentId === undefined || !requesters.has(e.agentId)) return { deny: CONTEXT_DENY }
+  if (wrappingUp(e)) return { deny: WRAPUP_DENY }
   if (childCalls.get(e.agentId)?.context === false) return { deny: CONTEXT_OFF_DENY }
   const bad = validateContext(e)
   if (bad) return { deny: bad }
@@ -781,6 +884,7 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
   // agentId -> { index, deadline, hardDeadline (from the spawn, rewrites included), revisions,
   //              last (last good answer), rewriting (a delivered rewrite is out) }
   const running = new Map()
+  const agentOf = new Array(e.questions.length) // question index -> its subagent, for the scope list
   activeRuns++
   try {
     for (;;) {
@@ -798,6 +902,11 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
           closeWindow(r)
           const out = outcomeOf(c)
           if (out.ok) r.last = out.text
+          if (r.wrapping) {
+            running.delete(id)
+            results[r.index] = out.ok && lengthOf(out.text) > maxChars ? { ok: true, text: out.text, shorten: true } : out
+            continue
+          }
           // Above the bound: ask the same subagent for a shorter one (its next turn.complete is the
           // new answer; the entry stays in `running`, the deadline stays the spawn's at most).
           if (out.ok && r.revisions < MAX_REVISIONS) {
@@ -819,6 +928,15 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
           // A rewrite that failed (error, empty answer) leaves the last good answer, to be shortened here.
           results[r.index] = !out.ok && r.last !== undefined ? { ok: true, text: r.last, shorten: true } : out
         } else if (now >= r.deadline) {
+          // Past its time with no answer yet: ask for what it found so far (tools refused from here on), once.
+          if (!r.wrapping && r.last === undefined && !r.rewriting && (await askWrapup($, id, minutes, maxChars))) {
+            r.wrapping = true
+            r.rewriting = true // the offer window stays open while the request is out (closeWindow ends it)
+            const c = childCalls.get(id)
+            if (c) c.wrapping = true
+            r.deadline = now + WRAPUP_TIMEOUT_MS
+            continue
+          }
           closeWindow(r)
           running.delete(id)
           const stopped = await stopAgent($, id)
@@ -830,7 +948,7 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
                   shorten: true,
                   why: now >= r.hardDeadline ? `書き直し中に ${minutes} 分でタイムアウト` : `書き直しが ${REWRITE_TIMEOUT_MS / 60000} 分で終わらなかった`,
                 }
-              : { ok: false, text: `ERROR: タイムアウト（${minutes} 分）。処理を${stopped ? '停止した' : '停止できなかった'}。` }
+              : { ok: false, text: `ERROR: タイムアウト（${minutes} 分）。${r.wrapping ? `途中までの答えも ${WRAPUP_TIMEOUT_MS / 60000} 分で返らなかった。` : ''}処理を${stopped ? '停止した' : '停止できなかった'}。` }
         }
       }
       while (running.size < MAX_PARALLEL && queue.length > 0) {
@@ -855,11 +973,12 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
         probeAgents.add(res.agentId)
         requesters.set(res.agentId, e.agentId ?? null)
         while (requesters.size > REQUESTERS_CAP) requesters.delete(requesters.keys().next().value)
-        childCalls.set(res.agentId, { effort: e.effort, context: e.context !== false, run })
+        childCalls.set(res.agentId, { effort: e.effort, context: e.context !== false, run, wrapping: false })
+        agentOf[index] = res.agentId
         while (childCalls.size > REQUESTERS_CAP) childCalls.delete(childCalls.keys().next().value)
         await rememberName($, res.agentId)
         const deadline = (await $.clock.now()) + timeoutMs
-        running.set(res.agentId, { index, deadline, hardDeadline: deadline, revisions: 0, last: undefined, rewriting: false })
+        running.set(res.agentId, { index, deadline, hardDeadline: deadline, revisions: 0, last: undefined, rewriting: false, wrapping: false })
       }
       if (running.size === 0 && queue.length === 0) break
       await park($, parks, signal)
@@ -874,6 +993,12 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
   await Promise.all(
     results.map(async (r, i) => {
       if (r && r.shorten) results[i] = await shortened($, e.questions[i], r, maxChars, model, signal)
+    }),
+  )
+  await Promise.all(
+    results.map(async (r, i) => {
+      const scope = agentOf[i] !== undefined ? await scopeOf($, agentOf[i]) : undefined
+      if (r && scope) results[i] = { ...r, scope }
     }),
   )
   const text = formatResults(results, maxChars)
@@ -959,10 +1084,14 @@ export function register(on) {
     if (next.called) return next(e)
     if (e.agentId === undefined) return next(e)
     if (probeAgents.has(e.agentId) || (activeRuns > 0 && !otherAgents.has(e.agentId))) {
-      return { deny: 'probe の読み取り専用の確認に失敗したため、この呼び出しは実行しない。' }
+      return { deny: GATE_FAIL_DENY }
     }
     return next(e)
   })
+
+  // Innermost: a probe subagent asked for its answer so far (past its time) may call no tool but the
+  // hand-back that carries the answer. The context tool answers above this, so it checks the same itself.
+  on('tool.call', async ($, e, next) => (wrappingUp(e) ? { deny: WRAPUP_DENY } : next(e))).catch(($, e, next) => next(e))
 
   // No sandbox here: a probe subagent's Bash runs only when Bash itself finds the command read-only.
   // In the sandbox: auto mode reviews the call as the model wrote it, so the wrapped one gets no verdict and is
