@@ -1139,7 +1139,7 @@ export function savingsOf(prows, ids, kidRows) {
 export function savingsLine(s) {
   const without = s.save1a + s.save1b + s.save2 + s.save4
   const line = `推定節約${s.net.toFixed(2)}$(API相当)`
-  return without > 0 ? `${line}　未使用時の${Math.round((s.net / without) * 100)}%削減` : line
+  return without > 0 ? `${line}　Probe未使用と比較し${Math.round((s.net / without) * 100)}%削減` : line
 }
 
 const callChildren = new Map() // tool_use_id of a main-loop probe call -> its subagents' ids

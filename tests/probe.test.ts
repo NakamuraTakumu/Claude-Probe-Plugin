@@ -1742,7 +1742,7 @@ test('savings: no line while the request after the result is not written, for an
 
 test('savingsLine: the saving in dollars, and its share of what the main loop would have paid without probe', () => {
   const s = { net: 0.8312, save1a: 0.3, save1b: 0.15, save2: 0.3, save4: 0.2, add1: 0.02, add2: 0.03, add3: 0.0688 }
-  expect(savingsLine(s)).toBe('推定節約0.83$(API相当)　未使用時の87%削減') // 0.8312 of 0.95
+  expect(savingsLine(s)).toBe('推定節約0.83$(API相当)　Probe未使用と比較し87%削減') // 0.8312 of 0.95
   // nothing saved to compare with (no tool step to replay): the dollars alone
   expect(savingsLine({ net: -0.019, save1a: 0, save1b: 0, save2: 0, save4: 0, add1: 0.011, add2: 0.001, add3: 0.007 })).toBe('推定節約-0.02$(API相当)')
 })
