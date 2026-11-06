@@ -7,8 +7,8 @@
 //   prompt.section      appends usage.md (the user's rules for probe, beyond the description) to the system
 //                       prompt section `env_info_model`, the one section that the main conversation, the
 //                       subagents the model starts and the probe subagents all carry (prompt.compose renders
-//                       the main one's only): the same text in the same place everywhere. A line after it
-//                       sets it aside where probe is not on offer (a probe subagent reads it too). It
+//                       the main one's only): the same text in the same place everywhere. A line under its
+//                       heading sets it aside where probe is not on offer (a probe subagent reads it too). It
 //                       replaces an `@` import of the file in CLAUDE.md, and follows the plugin on and off.
 //   /probe-mode        save | handy: which lines of usage.md go in (a line `<!-- save -->` or
 //                       `<!-- handy -->` starts lines of that mode only, `<!-- all -->` ends them).
@@ -41,17 +41,14 @@
 //                              hides probe:probe: the hook says "offered" while a rewrite is out.
 //                              If the rewrite cannot be had (not delivered, failed, too slow) the
 //                              answer is cut. Nothing but the subagent itself writes an answer.
-//   quotes                     the code of an answer (inline spans and fenced blocks) is a quote unless
-//                              the subagent marks it 非引用: each is looked for in what it read (its
-//                              transcript: the outputs as it read them, a Read output by its lines so the
-//                              label names file:lines; what it typed; the question). Code that fails is
-//                              sent back with the length (same rewrite, same limit), else marked. 〔〕 is probe's
-//                              own: in the subagent's text it becomes （）, and every mark probe adds
-//                              (verdicts, the scope list, the cut mark, the question heads) is in 〔〕.
+//   〔〕                         probe's own marks (the cut mark, the question heads): in the subagent's
+//                              text it becomes （）, so an answer cannot pass for one.
 //   tool.check                 allows the Agent call that starts probe:probe, and the TaskStop that stops
 //                              one, when this plugin raised them (its own $.agent.spawn, TaskStop). Auto mode's server-side classifier gives no
 //                              verdict for an action no model response asked for, and refuses it; the
 //                              subagent's own tool calls are still decided as any subagent's are.
+
+import { atom, memberOf, read, update } from 'claude-code'
 
 // "claude-*" is a reserved plugin name (claude plugin validate refuses it), hence probe.
 const PLUGIN = 'probe'
@@ -87,9 +84,6 @@ const MAX_MAX_CHARS = 8000
 const MAX_REVISIONS = 2
 const REWRITE_TIMEOUT_MS = 3 * 60 * 1000
 const WRAPUP_TIMEOUT_MS = 2 * 60 * 1000 // a question past its time is asked for what it found so far, and waited for this long
-const SCOPE_MAX_ENTRIES = 15
-const SCOPE_LINE_CHARS = 80
-const SCOPE_COMMAND_CHARS = 1500 // a Bash command in the scope list, whole (a heredoc's script too) up to this many characters
 const HANDBACK_TOOL = 'SubagentHandback' // how a subagent hands its answer back: neither refused nor listed
 const COMPLETIONS_CAP = 256
 const CHILD_MODEL = 'haiku' // probe always runs on haiku
@@ -117,21 +111,13 @@ export const SANDBOXES = [
 // park's waits, each a process (a `$` call, free of the hook's budget): sleep, else Windows' ping (~1 s).
 const PARKS = [['sleep', '0.5'], ['sleep', '1'], ['ping', '-n', '2', '127.0.0.1']]
 
+// Four paragraphs: what the work is, how to go about it, what the environment allows, how to answer.
 export const AGENT_PROMPT = [
   '依頼主の代わりに作業場や Web を調べ、コマンドを実行して結果を返す。依頼されたことだけを最短の手順で行う。ファイルは変更しない。',
-  'コマンドはなるべく1回の bash にまとめ、依存しない操作は並列に呼ぶ。Bash のファイルシステムは読み取り専用で、スクラッチパッドにも書けない。Bash からはネットワークにもつながらないので、Web は WebSearch と WebFetch で調べる。',
-  `スクリプトはファイルに書かず、python3 - <<'EOF' のように標準入力で渡す。一時ファイルは mktemp で作れるが、そのコマンドが終わると消えるので、同じコマンドの中で使い切る。各 Bash 呼び出しは独立で、cd や環境変数は残らない。`,
-  '「## 背景」は参考にする。足りなければ context ツールで依頼主の会話を必要な分だけ読む。',
-  `最後のメッセージがそのまま返る。結論を先に、既定では ${DEFAULT_MAX_CHARS} 字以内で書く。依頼の末尾に「結果の上限: N 字」とあれば N 字が上限。長さや形の指定があればそれに従う。前置き・経過・使ったコマンド・注意書きは書かない。`,
-  '依頼主は答えを確かめずに使うので、確かめていない推測には「推測」と書く。見つからなかったときは、そう書く。',
-  '読んだ出力から得たこと（コード、設定、ログ、コマンドの結果、識別子、パス）は、言い換えずに原文のままコードで書く。短いものはインラインのコード、複数行はコードブロック。地の文は結論と、原文どうしのつなぎにする。コードの中は出力から一字も変えずに写し、行番号・省略・注釈は入れない。行の一部だけでもよい。途中を省くならブロックを分ける。原文でないコード（自分で組み立てた式、書き換えたコード、修正案）には印を付ける：インラインのコードは直後に（非引用）、コードブロックは開きのフェンスに 非引用（```ts 非引用）。ファイルは Read で読み、その出力を写す。WebSearch と WebFetch から得たことは、この対象外。WebFetch の結果はページの原文ではなく要約なので、地の文で書き、出典の URL を添える。',
-  '失敗したことや分からなかったことはそのまま書く。日本語で書く。',
-  // One worked answer: code copied from the output as it is, a line or a part of one, and code of its own marked.
-  '\n\n例：Read の出力が次の2行だったとする。\n',
-  '12\tconst TTL = 15 * 60\n13\t  return TTL\n',
-  '答えには次のように書く。\n',
-  '有効期限は `15 * 60` 秒で、`return TTL` で返している。30 分にするなら `const TTL = 30 * 60`（非引用）。\n```\nconst TTL = 15 * 60\n  return TTL\n```',
-].join('')
+  'コマンドはなるべく1回の bash にまとめ、依存しない操作は並列に呼ぶ。「## 背景」は参考にし、足りなければ context ツールで依頼主の会話を必要な分だけ読む。',
+  `Bash のファイルシステムは読み取り専用で、スクラッチパッドにも書けない。ネットワークにもつながらないので、Web は WebSearch と WebFetch で調べる。スクリプトはファイルに書かず、python3 - <<'EOF' のように標準入力で渡す。一時ファイルは mktemp で作れるが、そのコマンドが終わると消えるので、同じコマンドの中で使い切る。各 Bash 呼び出しは独立で、cd や環境変数は残らない。`,
+  `最後のメッセージがそのまま返る。結論を先に、既定では ${DEFAULT_MAX_CHARS} 字以内で、日本語で書く。依頼の末尾に「結果の上限: N 字」とあれば N 字が上限。長さや形の指定があればそれに従う。前置き・経過・使ったコマンド・注意書きは書かない。依頼主は答えを確かめずに使うので、確かめていない推測には「推測」と書き、失敗したことや分からなかったことはそのまま書く。見つからなかったときは、そう書いて、探した場所と検索語を1行で添える。`,
+].join('\n\n')
 
 export const AGENT_SPEC = {
   name: AGENT_NAME,
@@ -147,9 +133,9 @@ export const TOOL_SPEC = {
   name: 'probe',
   description:
     '読み取り専用のシェルで調べて、結論か関係する原文の引用だけを返す。ファイルの検索、コマンドやテストの実行、Web 検索ができ、条件を明示すれば分岐を含む手順も任せられる。' +
-    '向くのは、どこにあるか分からないものを広く探すとき、多くのファイルにまたがるとき、長い出力（ログ、コマンドの出力）から要点だけ欲しいとき、Web で調べるとき。これから編集する箇所と、すぐ済む確認は自分でやる。' +
+    '向くのは、どこにあるか分からないものを広く探すとき、多くのファイルにまたがるとき、長い出力（ログ、コマンドの出力）から要点だけ欲しいとき、Web で調べるとき。' +
     '判断は、基準を問いに書けるなら任せられる。会話全体の文脈や好みに依る判断は任せず、材料集めに使う。' +
-    '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれる。〔〕 は probe が付ける印。答えの中のコード（インラインのコードとコードブロック）は、印がなければツールの出力と照合済みの原文。コードブロックには出どころが 〔一致：…〕 で付く。原文でないと書き手が示したコードには 〔非引用〕、照合できなかったコードには 〔一致しない〕 が付く。WebFetch の出力はページの原文ではなく要約なので、Web の内容は原文と照合されていない。答えの後ろには、調べた範囲（使ったツールの一覧）が付く。',
+    '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれ、見つからなかったときは探した範囲が書かれる。〔〕 は probe が付ける印。',
   inputSchema: {
     type: 'object',
     properties: {
@@ -274,20 +260,6 @@ export function rewriteRequest(n, max) {
   return `結果が ${n} 字で、上限 ${max} 字を超えた。結論を先に、${max} 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。`
 }
 
-/**
- * What the subagent is asked when its answer is above the bound (`n` characters, else undefined) or has
- * quotes that fail (`failures`: { head, reason }); with no failures, rewriteRequest.
- */
-export function reviseRequest(n, max, failures = []) {
-  if (failures.length === 0) return rewriteRequest(n, max)
-  const lines = ['答えを直して。']
-  if (n !== undefined) lines.push(`- 結果が ${n} 字で、上限 ${max} 字を超えた。結論を先に、${max} 字以内にする。必要な情報だけ残す。`)
-  lines.push('- 次のコードは、読んだ出力のどこにもない。出力から一字も変えずに写し直すか、原文でないなら印を付ける（インラインのコードは直後に（非引用）、コードブロックは開きのフェンスに 非引用）。')
-  for (const f of failures) lines.push(`  - ${f.head}：${f.reason}`)
-  lines.push('直した答えの全体だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。')
-  return lines.join('\n')
-}
-
 /** What a subagent past its time is asked for: its answer so far, by the usual rules, with no more lookups. */
 export function wrapupRequest(minutes, max) {
   return `時間切れ（${minutes} 分）。これ以上は調べない（道具は断られる）。ここまでで分かったことを、ふつうの答えと同じ決まりで、結論を先に ${max} 字以内で書く。時間内に調べきれなかったことは、分からなかったこととして書く。書いた答えだけを最後のメッセージに書く。`
@@ -295,122 +267,15 @@ export function wrapupRequest(minutes, max) {
 
 export const WRAPUP_DENY = 'probe の時間切れのため、道具は使えない。ここまでで分かったことを答えとして書き、最後のメッセージにする。'
 
-/** What a tool call of a subagent did (`e` as tool.call has it), as `Tool: what`: a Bash command whole, all its lines. */
-function callWhat(e) {
-  const str = (k) => (typeof e[k] === 'string' ? e[k] : '')
-  let what
-  switch (e.tool) {
-    case 'Bash':
-      what = str('command').trim()
-      break
-    case 'Read': {
-      const from = typeof e.offset === 'number' ? e.offset : 1
-      what = str('file_path') + (typeof e.limit === 'number' ? `:${from}-${from + e.limit - 1}` : typeof e.offset === 'number' ? `:${from}-` : '')
-      break
-    }
-    case 'Grep':
-      what = `"${str('pattern')}" in ${str('path') || '.'}${str('glob') ? ` (${str('glob')})` : ''}`
-      break
-    case 'Glob':
-      what = `${str('pattern')} in ${str('path') || '.'}`
-      break
-    case 'WebSearch':
-      what = str('query')
-      break
-    case 'WebFetch':
-      what = str('url')
-      break
-    default: {
-      const { tool, tool_use_id, agentId, requestMeta, consent, ...input } = e
-      what = JSON.stringify(input)
-    }
-  }
-  return `${e.tool}: ${what}`
-}
-
-/** `text` when it has at most `max` characters, else its first `max - 1` and `…`. */
-function clip(text, max) {
-  const chars = Array.from(text)
-  return chars.length <= max ? text : chars.slice(0, max - 1).join('') + '…'
-}
-
-/**
- * A tool call of a subagent as the scope list shows it, its 〔〕 turned into （） (a command could forge
- * probe's marks): a Bash command whole, all its lines (a heredoc's script too), up to SCOPE_COMMAND_CHARS
- * characters and the rest marked; any other call in one line of at most SCOPE_LINE_CHARS.
- */
-export function callLine(e) {
-  const what = escapeMarks(callWhat(e))
-  if (e.tool !== 'Bash') return clip(what, SCOPE_LINE_CHARS)
-  const chars = Array.from(what)
-  if (chars.length <= SCOPE_COMMAND_CHARS) return what
-  return chars.slice(0, SCOPE_COMMAND_CHARS).join('') + `\n〔以下 ${chars.length - SCOPE_COMMAND_CHARS} 字略〕`
-}
-
-/** How a quote names the call it is from: the first line of its scope line, at most SCOPE_LINE_CHARS, `…` where cut. */
-export function callHead(e) {
-  const [first, ...more] = callLine(e).split('\n')
-  return clip(more.length > 0 ? first + '…' : first, SCOPE_LINE_CHARS)
-}
-
 /** Whether `e` (a tool call) comes from a probe subagent past its time, and is not the hand-back. */
 function wrappingUp(e) {
   return e.agentId !== undefined && e.tool !== HANDBACK_TOOL && childCalls.get(e.agentId)?.wrapping === true
 }
 
-/**
- * The tool calls of a subagent's transcript that the scope list shows, in order: each as the model wrote it
- * (before the sandbox wrapped it), as its scope line (callLine; its first line marked when the call ended in
- * an error), with its id. Not the hand-back, nor what the wrap-up refused.
- */
-function scopeCalls(messages) {
-  const calls = []
-  for (const m of messages) {
-    for (const u of (m && m.toolUses) || []) {
-      if (!u || u.tool === HANDBACK_TOOL || u.text === WRAPUP_DENY) continue
-      const input = u.input && typeof u.input === 'object' ? u.input : {}
-      const [first, ...more] = callLine({ ...input, tool: u.tool }).split('\n')
-      calls.push({ id: u.tool_use_id, line: [first + (u.isError ? '（エラー）' : ''), ...more].join('\n') })
-    }
-  }
-  return calls
+/** The subagent's own text, with probe's brackets 〔〕 turned into （） so that no mark of probe can be written by it. */
+export function escapeMarks(text) {
+  return String(text).replace(/〔/g, '（').replace(/〕/g, '）')
 }
-
-/** The scope list of a subagent, from its transcript (scopeCalls). */
-async function scopeOf($, agentId) {
-  try {
-    const messages = await $.session.messages({ agentId })
-    if (!Array.isArray(messages)) return SCOPE_UNREAD
-    return scopeText(scopeCalls(messages).map((c) => c.line))
-  } catch {
-    return SCOPE_UNREAD
-  }
-}
-
-/**
- * The scope list after an answer, always there (an answer could claim lookups it never made): the
- * subagent's tool calls, each distinct one once (the same whole line), numbered in the order they first
- * ran (a quote names its source by that number: sourcesOf), with how many times it ran; the further lines
- * of a call (a Bash script) indented under it. At most SCOPE_MAX_ENTRIES.
- */
-export function scopeText(lines) {
-  const all = lines || []
-  if (all.length === 0) return '〔調べた範囲（呼び出し 0 回）：ツールは使っていない〕'
-  const counts = new Map()
-  for (const l of all) counts.set(l, (counts.get(l) || 0) + 1)
-  const entries = [...counts]
-  const entry = ([l, n], i) => {
-    const [first, ...more] = l.split('\n')
-    const pad = ' '.repeat(`${i + 1}. `.length)
-    return [`${i + 1}. ${first}${n > 1 ? `（${n}回）` : ''}`, ...more.map((m) => (m ? pad + m : m))].join('\n')
-  }
-  const shown = entries.slice(0, SCOPE_MAX_ENTRIES).map(entry)
-  const rest = entries.slice(SCOPE_MAX_ENTRIES)
-  if (rest.length > 0) shown.push(`ほか ${rest.length} 種類（${rest.reduce((a, [, n]) => a + n, 0)}回）`)
-  return `〔調べた範囲（呼び出し ${all.length} 回）〕\n${shown.join('\n')}`
-}
-
-export const SCOPE_UNREAD = '〔調べた範囲：子の記録を読めなかった〕'
 
 /** The text itself when it fits in `max` characters, else its first `max` characters and a mark. */
 function fit(text, max, why) {
@@ -424,281 +289,9 @@ function fit(text, max, why) {
  * question, in question order. No file path lines. An answer above `maxChars` is cut (marked).
  */
 export function formatResults(results, maxChars = DEFAULT_MAX_CHARS) {
-  const body = (r) => fit(r ? r.text : 'ERROR: 結果なし', maxChars, r && r.why) + (r && r.scope ? '\n\n' + r.scope : '')
+  const body = (r) => fit(r ? r.text : 'ERROR: 結果なし', maxChars, r && r.why)
   if (results.length === 1) return body(results[0])
   return results.map((r, i) => `〔問い ${i + 1}〕\n${body(r)}`).join('\n\n')
-}
-
-// ---------------------------------------------------------------- quotes
-
-const FENCE_OPEN = /^([ \t]*)(`{3,}|~{3,})(.*)$/
-const NOT_QUOTE = '非引用'
-const NOT_QUOTE_AFTER = /^ ?[（(]非引用(?:[、,，：:][^）)\n]*)?[）)]/ // （非引用）, （非引用、why）, one space before
-const READ_LINE = /^\s*(\d+)(?:\t|→)(.*)$/
-const MAX_PLACES = 3
-const MAX_FAILURES_SHOWN = 10 // the failed code a rewrite request lists
-
-/** The subagent's own text, with probe's brackets 〔〕 turned into （） so that no mark of probe can be written by it. */
-export function escapeMarks(text) {
-  return String(text).replace(/〔/g, '（').replace(/〕/g, '）')
-}
-
-/**
- * The code of an answer, in order: every fenced block and every inline code span, each taken for a quote
- * of what the subagent read unless it says it is not one (`notQuote`): a block by 非引用 in its info
- * string, a span by （非引用） right after it. Fences as Markdown reads them: a block ends at a line of its
- * fence's character, at least as long, and nothing else (`closed: false` when none: it runs to the end),
- * so a longer fence holds a shorter one. A span (spansOf) is on one line outside the blocks.
- * `start`/`end` bound each, a block's fence lines and a span's （非引用） included.
- * A block: `raw` its content as written, `body` the same with the opening fence's indentation (a block in
- * a list) taken off each line, `lang` its info string but 非引用, `indent`/`fence`/`close` what rendering keeps.
- */
-export function quotesOf(text) {
-  const s = String(text)
-  const lines = s.split('\n')
-  const at = []
-  for (let i = 0, p = 0; i < lines.length; i++) {
-    at.push(p)
-    p += lines[i].length + 1
-  }
-  const quotes = []
-  for (let i = 0; i < lines.length; i++) {
-    const m = FENCE_OPEN.exec(lines[i].replace(/\r$/, ''))
-    if (!m || (m[2][0] === '`' && m[3].includes('`'))) {
-      quotes.push(...spansOf(lines[i], at[i]))
-      continue
-    }
-    const [, indent, fence, info] = m
-    const closes = (l) => {
-      const t = l.trim()
-      return t.length >= fence.length && t === fence[0].repeat(t.length)
-    }
-    let j = i + 1
-    while (j < lines.length && !closes(lines[j])) j++
-    const closed = j < lines.length
-    const tokens = info.trim().split(/\s+/).filter(Boolean)
-    const content = lines.slice(i + 1, j)
-    const dedent = (l) => {
-      let n = 0
-      while (n < indent.length && (l[n] === ' ' || l[n] === '\t')) n++
-      return l.slice(n)
-    }
-    quotes.push({
-      kind: 'block',
-      start: at[i],
-      end: closed ? at[j] + lines[j].length : s.length,
-      notQuote: tokens.includes(NOT_QUOTE),
-      lang: tokens.filter((t) => t !== NOT_QUOTE).join(' '),
-      indent,
-      fence,
-      raw: content.length > 0 ? content.join('\n') : undefined,
-      body: content.map(dedent).join('\n'),
-      close: closed ? lines[j] : undefined,
-      closed,
-    })
-    i = closed ? j : lines.length
-  }
-  return quotes
-}
-
-/**
- * The inline code spans of one line outside the blocks, at `offset` in the answer, as Markdown reads them:
- * a run of backticks up to the next run of the same length (a run with none is text). `ticks` its
- * backticks, `raw` what is between them, `body` the same less one space at each end when both have one.
- */
-function spansOf(line, offset) {
-  const spans = []
-  const runs = [...line.matchAll(/`+/g)]
-  for (let a = 0; a < runs.length; a++) {
-    const open = runs[a]
-    const b = runs.findIndex((r, x) => x > a && r[0].length === open[0].length)
-    if (b < 0) continue
-    const close = runs[b]
-    const raw = line.slice(open.index + open[0].length, close.index)
-    const strip = raw.length >= 2 && raw.startsWith(' ') && raw.endsWith(' ') && raw.trim() !== ''
-    let end = close.index + close[0].length
-    const after = NOT_QUOTE_AFTER.exec(line.slice(end))
-    if (after) end += after[0].length
-    spans.push({ kind: 'span', start: offset + open.index, end: offset + end, notQuote: after !== null, ticks: open[0], raw, body: strip ? raw.slice(1, -1) : raw, closed: true })
-    a = b
-  }
-  return spans
-}
-
-/** Text compared line by line without what ends a line (CR, trailing blanks). */
-function plain(text) {
-  return String(text)
-    .replace(/\r\n?/g, '\n')
-    .split('\n')
-    .map((l) => l.replace(/[ \t]+$/, ''))
-    .join('\n')
-}
-
-/** The numbered lines of a Read output (`12\tcode`), or null when it has none (a PDF, an image). */
-function readLines(text) {
-  const lines = []
-  for (const l of String(text).replace(/\r\n?/g, '\n').split('\n')) {
-    const m = READ_LINE.exec(l)
-    if (m) lines.push({ no: Number(m[1]), text: m[2].replace(/[ \t]+$/, '') })
-  }
-  return lines.length > 0 ? lines : null
-}
-
-/** Every place `needle` starts in `hay`. */
-function placesOf(hay, needle) {
-  const at = []
-  for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + 1)) at.push(i)
-  return at
-}
-
-/** Line ranges (`12-13`, `40`) of the places a quote of `size` characters was found in the joined Read lines. */
-function rangesOf(lines, places, size) {
-  const starts = []
-  let pos = 0
-  for (const l of lines) {
-    starts.push(pos)
-    pos += l.text.length + 1
-  }
-  const lineAt = (offset) => {
-    let i = 0
-    while (i + 1 < starts.length && starts[i + 1] <= offset) i++
-    return lines[i].no
-  }
-  return places.map((p) => {
-    const a = lineAt(p)
-    const b = lineAt(p + Math.max(0, size - 1))
-    return a === b ? `${a}` : `${a}-${b}`
-  })
-}
-
-/**
- * How a quote names an output other than a file's: the call's first line (callHead), and, when that is not
- * the whole call (a script, a long command), the call's number in the scope list (`entry`) where it is whole.
- */
-function sourceLabel(e, entry) {
-  const head = callHead(e)
-  return head === callLine(e) || entry === undefined ? head : `${head}（調べた範囲の ${entry}）`
-}
-
-/**
- * What a subagent read, from its transcript: `outputs`, its tool calls' outputs as it read them ({ tool,
- * input, text, entry }; entry: the call's number in the scope list); `inputs`, each string it typed into a
- * call (a command, a path, a pattern; same shape); `question`, the user messages before its first answer
- * (a rewrite request is not one). Not the hand-back, nor what the wrap-up refused.
- */
-export function sourcesFrom(messages) {
-  const entryOf = new Map()
-  const entries = new Map()
-  for (const c of scopeCalls(messages)) {
-    if (!entries.has(c.line)) entries.set(c.line, entries.size + 1)
-    entryOf.set(c.id, entries.get(c.line))
-  }
-  const outputs = []
-  const inputs = []
-  const asked = []
-  let answered = false
-  for (const m of messages) {
-    if (!m) continue
-    if (m.role === 'assistant') answered = true
-    if (m.role === 'user' && !answered && typeof m.text === 'string') asked.push(m.text)
-    for (const u of m.toolUses || []) {
-      if (!u || u.tool === HANDBACK_TOOL || u.text === WRAPUP_DENY) continue
-      const input = u.input && typeof u.input === 'object' ? u.input : {}
-      const entry = entryOf.get(u.tool_use_id)
-      if (typeof u.text === 'string') outputs.push({ tool: u.tool, input, text: u.text, entry })
-      for (const v of Object.values(input)) if (typeof v === 'string' && v !== '') inputs.push({ tool: u.tool, input, text: v, entry })
-    }
-  }
-  return { outputs, inputs, question: asked.join('\n') }
-}
-
-/**
- * The verdict on one piece of code (quotesOf) against what the subagent read (sourcesFrom; null when its
- * transcript could not be read). Code said not to be a quote is not checked; empty code passes. Otherwise
- * it is looked for in a file's lines first (Read, by its lines without their numbers: the label names
- * file:lines), then in any output as text, what the subagent typed, the question.
- * -> { ok: true, label?, notQuote? } | { ok: false, fixable, reason } (fixable: the subagent can mend it).
- */
-export function checkQuote(q, sources) {
-  if (q.notQuote) return { ok: true, notQuote: true }
-  if (!q.closed) return { ok: false, fixable: true, reason: '閉じるフェンスがない' }
-  const body = plain(q.body).replace(/^\n+/, '').replace(/\n+$/, '')
-  if (!body.trim()) return { ok: true }
-  if (sources === null) return { ok: false, fixable: false, reason: '子の記録を読めなかった' }
-  const lines = body.split('\n')
-  const needles = [body.trim()]
-  if (lines.every((l) => READ_LINE.test(l))) needles.push(lines.map((l) => READ_LINE.exec(l)[2]).join('\n').trim()) // copied with Read's numbers
-  for (const src of sources.outputs) {
-    const read = src.tool === 'Read' ? readLines(src.text) : null
-    if (!read) continue
-    const path = typeof src.input.file_path === 'string' ? src.input.file_path : ''
-    const hay = read.map((l) => l.text).join('\n')
-    for (const needle of needles) {
-      const places = placesOf(hay, needle)
-      if (places.length === 0) continue
-      const ranges = rangesOf(read, places.slice(0, MAX_PLACES), needle.length)
-      const more = places.length > MAX_PLACES ? ` ほか ${places.length - MAX_PLACES} か所` : ''
-      return { ok: true, label: `${path}:${ranges.join('、')}${more}` }
-    }
-  }
-  const needle = needles[0]
-  for (const src of sources.outputs) {
-    if (src.tool === 'Read' && readLines(src.text)) continue
-    if (!plain(src.text).includes(needle)) continue
-    return { ok: true, label: src.tool === 'Read' ? String(src.input.file_path ?? '') : sourceLabel({ ...src.input, tool: src.tool }, src.entry) }
-  }
-  for (const src of sources.inputs) {
-    if (plain(src.text).includes(needle)) return { ok: true, label: `${sourceLabel({ ...src.input, tool: src.tool }, src.entry)} の入力` }
-  }
-  if (plain(sources.question).includes(needle)) return { ok: true, label: '問い' }
-  return { ok: false, fixable: true, reason: 'どの出力にもない' }
-}
-
-/**
- * The answer as the caller gets it: the subagent's text with 〔〕 turned into （）, its code with probe's
- * verdict. Code that matched stays as written (it is the output's own text): a span with no mark, a block
- * with 〔一致：source〕 in its info string. Code said not to be a quote gets 〔非引用〕 (in place of the
- * subagent's （非引用）), code that failed 〔一致しない：…〕 or 〔確かめられない：…〕.
- */
-export function renderAnswer(text, quotes, verdicts) {
-  const s = String(text)
-  let out = ''
-  let at = 0
-  quotes.forEach((q, i) => {
-    out += escapeMarks(s.slice(at, q.start)) + (q.kind === 'block' ? renderBlock(q, verdicts[i]) : renderSpan(q, verdicts[i]))
-    at = q.end
-  })
-  return out + escapeMarks(s.slice(at))
-}
-
-/** probe's mark for a verdict ('' for code that matched with no source to name). */
-function markOf(v) {
-  if (v.notQuote) return '〔非引用〕'
-  if (v.ok) return v.label !== undefined ? `〔一致：${escapeMarks(v.label)}〕` : ''
-  return v.fixable ? `〔一致しない：${v.reason}〕` : `〔確かめられない：${v.reason}〕`
-}
-
-function renderBlock(q, v) {
-  const asIs = v.ok && !v.notQuote
-  // the info string of a backtick fence holds no backtick (else Markdown reads no fence)
-  const info = [escapeMarks(q.lang), markOf(v)].filter(Boolean).join(' ').replace(/`/g, "'")
-  const parts = [`${q.indent}${q.fence}${info}`]
-  if (q.raw !== undefined) parts.push(asIs ? q.raw : escapeMarks(q.raw))
-  if (q.closed) parts.push(q.close)
-  return parts.join('\n')
-}
-
-function renderSpan(q, v) {
-  if (v.ok && !v.notQuote) return `${q.ticks}${q.raw}${q.ticks}`
-  return `${q.ticks}${escapeMarks(q.raw)}${q.ticks}${markOf(v)}`
-}
-
-/** How failed code is named in the request to mend it: the start of its first line. */
-function quoteHead(q) {
-  const first = plain(q.body).trim().split('\n')[0] || ''
-  const chars = Array.from(first)
-  const shown = chars.length > 40 ? chars.slice(0, 40).join('') + '…' : first
-  return q.kind === 'block' ? `コードブロック「${shown}」` : `「${shown}」`
 }
 
 const SYSTEM_REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g
@@ -795,7 +388,7 @@ const HANDBACK_STUB = 'probe: probe の hand-back（内容は tool の結果に�
 const NOTIFICATION_STUB = 'probe: probe の完了通知（内容は tool の結果に含まれている）'
 
 // The engine's note on a delivery of the tools its sender used that the conversation has not been told
-// of (a probe's are in the answer's scope too). Wrapped in a reminder in the stored row; prompt.attachment
+// of (for a probe, nothing the parent needs: the answer is in the tool result). Wrapped in a reminder in the stored row; prompt.attachment
 // gets the text with that wrapper taken off, as the engine puts its own around the whole.
 const TOOLS_USED = /<tools-used-before-summary>[\s\S]*?<\/tools-used-before-summary>/g
 
@@ -1073,8 +666,8 @@ async function stopAgent($, agentId) {
  * open from here on; it stays open when the request was delivered (the caller closes it with
  * closeWindow when the rewrite is over) and shuts at once when not. The outcome goes to the trace.
  */
-async function askRewrite($, agentId, n, max, failures = []) {
-  return askAgain($, agentId, reviseRequest(n, max, failures), { hook: 'rewrite', length: n, max, quotes: failures.length })
+async function askRewrite($, agentId, n, max) {
+  return askAgain($, agentId, rewriteRequest(n, max), { hook: 'rewrite', length: n, max })
 }
 
 /** Asks the (still running) subagent past its time for its answer so far; whether it was delivered. */
@@ -1106,43 +699,17 @@ function closeWindow(r) {
   }
 }
 
-/** What subagent `agentId` read (sourcesFrom), from its transcript; null when it cannot be read. */
-async function sourcesOf($, agentId) {
-  let messages
-  try {
-    messages = await $.session.messages({ agentId })
-  } catch {
-    return null
-  }
-  return Array.isArray(messages) ? sourcesFrom(messages) : null
-}
-
-/**
- * An answer of subagent `agentId` checked: `text` as the caller gets it (renderAnswer) and the code that
- * failed in a way the subagent can mend ({ head, reason }, each distinct one once, at most MAX_FAILURES_SHOWN
- * and a count of the rest). The verdicts go to the trace.
- */
-async function checkAnswer($, agentId, answer) {
-  const quotes = quotesOf(answer)
-  const sources = quotes.some((q) => !q.notQuote) ? await sourcesOf($, agentId) : { outputs: [], inputs: [], question: '' }
-  const verdicts = quotes.map((q) => checkQuote(q, sources))
-  const heads = new Map()
-  verdicts.forEach((v, i) => {
-    if (!v.ok && v.fixable) heads.set(quoteHead(quotes[i]), v.reason)
-  })
-  const failures = [...heads].slice(0, MAX_FAILURES_SHOWN).map(([head, reason]) => ({ head, reason }))
-  if (heads.size > MAX_FAILURES_SHOWN) failures.push({ head: `ほか ${heads.size - MAX_FAILURES_SHOWN} 個`, reason: '同じく' })
-  if (quotes.length > 0) {
-    await traceLine($, { hook: 'quotes', agentId, total: quotes.length, ok: verdicts.filter((v) => v.ok && !v.notQuote).length, notQuote: verdicts.filter((v) => v.notQuote).length, failed: verdicts.filter((v) => !v.ok).map((v) => v.reason) })
-  }
-  return { text: renderAnswer(answer, quotes, verdicts), failures }
-}
-
 // ---------------------------------------------------------------- the usage rules
 
-/** A section's text with the usage rules after it, and the line that sets them aside where probe is not on offer. */
+/**
+ * A section's text with the usage rules after it. The line that sets them aside where probe is not on
+ * offer comes first (after their heading, if they open with one): a probe subagent gets the rules too
+ * (prompt.section does not say whose prompt it is), and learns at once that they are not for it.
+ */
 export function withUsage(text, usage) {
-  return `${text}\n\n${usage}\n\n${USAGE_SCOPE}`
+  const [first, ...rest] = String(usage).split('\n')
+  const lines = /^#/.test(first) ? [first, USAGE_SCOPE, ...rest] : [USAGE_SCOPE, first, ...rest]
+  return `${text}\n\n${lines.join('\n')}`
 }
 
 /**
@@ -1256,7 +823,6 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
   // agentId -> { index, deadline, hardDeadline (from the spawn, rewrites included), revisions,
   //              last (last good answer), rewriting (a delivered rewrite is out) }
   const running = new Map()
-  const agentOf = new Array(e.questions.length) // question index -> its subagent, for the scope list
   activeRuns++
   try {
     for (;;) {
@@ -1279,16 +845,15 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
             results[r.index] = r.last !== undefined ? { ok: true, text: r.last } : out
             continue
           }
-          const checked = await checkAnswer($, id, out.text)
-          r.last = checked.text
-          const n = lengthOf(checked.text)
-          const over = n > maxChars
-          // Above the bound, or a quote that fails: ask the same subagent to mend it (its next turn.complete
-          // is the new answer; the entry stays in `running`, the deadline stays the spawn's at most). Not the
-          // answer so far of one past its time, nor past MAX_REVISIONS, nor when the request cannot be
-          // delivered: that answer is taken as it is (cut when too long, failed quotes marked).
-          if (!r.wrapping && r.revisions < MAX_REVISIONS && (over || checked.failures.length > 0)) {
-            if (await askRewrite($, id, over ? n : undefined, maxChars, checked.failures)) {
+          const text = escapeMarks(out.text)
+          r.last = text
+          const n = lengthOf(text)
+          // Above the bound: ask the same subagent to write it again (its next turn.complete is the new
+          // answer; the entry stays in `running`, the deadline stays the spawn's at most). Not the answer so
+          // far of one past its time, nor past MAX_REVISIONS, nor when the request cannot be delivered: that
+          // answer is taken as it is (cut).
+          if (!r.wrapping && r.revisions < MAX_REVISIONS && n > maxChars) {
+            if (await askRewrite($, id, n, maxChars)) {
               r.revisions++
               r.rewriting = true
               r.deadline = Math.min(r.hardDeadline, (await $.clock.now()) + REWRITE_TIMEOUT_MS)
@@ -1296,7 +861,7 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
             }
           }
           running.delete(id)
-          results[r.index] = { ok: true, text: checked.text }
+          results[r.index] = { ok: true, text }
         } else if (now >= r.deadline) {
           // Past its time with no answer yet: ask for what it found so far (tools refused from here on), once.
           if (!r.wrapping && r.last === undefined && !r.rewriting && (await askWrapup($, id, minutes, maxChars))) {
@@ -1343,7 +908,6 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
         requesters.set(res.agentId, e.agentId ?? null)
         while (requesters.size > REQUESTERS_CAP) requesters.delete(requesters.keys().next().value)
         childCalls.set(res.agentId, { effort: e.effort, context: e.context !== false, run, wrapping: false })
-        agentOf[index] = res.agentId
         while (childCalls.size > REQUESTERS_CAP) childCalls.delete(childCalls.keys().next().value)
         if (e.agentId === undefined && typeof e.tool_use_id === 'string') {
           callChildren.set(e.tool_use_id, [...(callChildren.get(e.tool_use_id) ?? []), res.agentId])
@@ -1362,12 +926,6 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
     for (const r of running.values()) closeWindow(r)
     for (const id of running.keys()) await stopAgent($, id)
   }
-  await Promise.all(
-    results.map(async (r, i) => {
-      const scope = agentOf[i] !== undefined ? await scopeOf($, agentOf[i]) : undefined
-      if (r && scope) results[i] = { ...r, scope }
-    }),
-  )
   const text = formatResults(results, maxChars)
   if (results.every((r) => !r.ok)) return { deny: 'probe: すべての問いが失敗した。\n' + text }
   return { result: text }
@@ -1375,10 +933,15 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
 
 // ---------------------------------------------------------------- savings estimate
 //
-// After each probe call of the main loop, one line for the person ($.ui.log: drawn under the call, not sent
-// to the model, not kept in the transcript file): what the call saved in API prices against the main loop
-// doing the same work itself. The calculation is the trial script's of 2026-11-05 (docs/design.md, 節約の
-// 見積もり), read from the same transcript files: the main loop's and each subagent's.
+// After each probe call of the main loop, one line for the person, drawn on the call's own row (ui.render
+// ToolUse) once the estimate can be made; not sent to the model, not kept in the transcript file: what the
+// call saved in API prices against the main loop doing the same work itself. The calculation is the trial
+// script's of 2026-11-05 (docs/design.md, 節約の見積もり), read from the same transcript files: the main
+// loop's and each subagent's.
+
+// The line of each call, by its tool_use_id (a member per row: memberOf). Written by showSavings; the row's
+// drawing reads it, so the write draws that row again.
+const savingsShown = atom({ plugin: 'probe', key: 'savings' }, '')
 
 const PRICE_OPUS = { in: 4, w5: 5, w1h: 8, read: 0.2, out: 20 } // $ per million tokens, claude-opus-5-5
 const PRICE_HAIKU = [0.1, 0.5] // claude-haiku-5-5 input and output, a prompt of up to 100K tokens
@@ -1638,9 +1201,9 @@ async function showSavings($) {
     }
     for (const t of ids) savingsPending.delete(t)
     if (s.status === 'ok') {
-      try {
-        $.ui.log(savingsLine(s))
-      } catch {}
+      // Calls of one request share one estimate: on the row of the last of them, with how many it covers.
+      const line = savingsLine(s) + (ids.length > 1 ? `（probe ${ids.length} 件分）` : '')
+      await update($, memberOf(savingsShown, { requestId: ids[ids.length - 1] }), () => line)
     }
   }
 }
@@ -1715,6 +1278,16 @@ export function register(on) {
     const r = await next(e)
     if (savingsPending.size > 0) await trySavings($) // the turn's last request is in the transcript by now
     return r
+  })
+
+  // A probe call's row: as the engine draws it, and under it the call's savings line once there is one.
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    if (e.props.tool !== PROBE_TOOL) return next(e)
+    const line = await read($, memberOf(savingsShown, e))
+    const row = await next(e)
+    if (!line) return row
+    const { Box, Text } = $.ui.resolve(e)
+    return h(Box, { flexDirection: 'column' }, row, h(Text, { dimColor: true }, line))
   })
 
   on('tool.call', { tool: PROBE_TOOL }, async ($, e, next) => {
