@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { recordRows, requestsOf, savingsOf, savingsLine, probeGroupOf } from '../hooks/register.js'
+import { CONDENSE_SYSTEM, condensePrompt, condensedBody, conversationItems, conversationText, headTail } from '../hooks/register.js'
 import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, BASH_DEFAULT_TIMEOUT_MS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, escapeMarks, SANDBOXES, WRAPUP_DENY, wrapupRequest, onlyStubs, shQuote, stopSeconds, stoppedNote, taskIdsOf, wrapCommand } from '../hooks/register.js'
 
 const AGENT = 'probe:probe'
@@ -14,7 +15,7 @@ type Script = { answer?: string; reason?: string; parks?: number; never?: boolea
  * its next run follows `then` of its script), the `sleep` park (the subagents finish
  * there, by script), bwrap, TaskStop and the clock.
  */
-function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; sleep?: boolean; send?: 'refuse' | 'throw'; messages?: any[] | 'throw' | 'deny'; usage?: string | 'missing'; sleepFails?: number; script?: (prompt: string, n: number) => Script; agents?: any[]; listThrows?: boolean; clockThrows?: boolean; names?: Record<string, string>; trace?: boolean; files?: Record<string, string> } = {}) {
+function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; sleep?: boolean; send?: 'refuse' | 'throw'; messages?: any[] | 'throw' | 'deny'; usage?: string | 'missing'; sleepFails?: number; script?: (prompt: string, n: number) => Script; agents?: any[]; listThrows?: boolean; clockThrows?: boolean; names?: Record<string, string>; trace?: boolean; files?: Record<string, string>; bashOut?: { stdout: string; isError?: boolean; isReadOnly?: boolean; persisted?: string }; complete?: 'ok' | 'long' | 'throw'; writeFails?: boolean } = {}) {
   if (options.clockThrows) on('clock.now', () => { throw new Error('boom') })
   const w = {
     clock: options.clockThrows ? (undefined as any) : mock.clock(on),
@@ -36,6 +37,7 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
     toasts: [] as string[],
     logs: [] as string[],
     invalidated: [] as any[],
+    writes: [] as Array<{ path: string; text: string }>,
     sleepFails: options.sleepFails ?? 0,
     onPark: [] as Array<() => Promise<void>>,
     agents: options.agents ?? ([] as any[]),
@@ -75,6 +77,12 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
   on('fs.list', (_$: any, e: any) => {
     const names = new Set(Object.keys(files).filter((p) => p.startsWith(e.path + '/')).map((p) => p.slice(e.path.length + 1).split('/')[0]))
     return { value: [...names].map((name) => ({ name, kind: Object.keys(files).some((p) => p.startsWith(`${e.path}/${name}/`)) ? 'dir' : 'file', size: 0, mtimeMs: 0, isLink: false })) }
+  })
+  on('fs.write', (_$: any, e: any) => {
+    if (options.writeFails) throw new Error('EACCES')
+    w.writes.push({ path: String(e.path), text: String(e.text) })
+    files[e.path] = String(e.text)
+    return { value: undefined }
   })
   on('fs.exists', (_$: any, e: any) => ({ value: files[e.path] !== undefined || Object.keys(files).some((p) => p.startsWith(e.path + '/')) }))
   on('fs.stat', (_$: any, e: any) => {
@@ -121,16 +129,26 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
     w.live.set(id, { prompt: e.text, script: prev.then ?? { answer: 'rewritten' }, parks: 0 })
     return { isDelivered: true }
   })
-  // probe never calls a model itself (only its subagents write answers): recorded to show it.
+  // A model call is only the summary of a long Bash output (`complete`); else it fails, to show none is wanted.
   const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
   on('model.complete', (_$: any, e: any) => {
     w.completes.push(e)
+    if (options.complete === 'throw') throw new Error('model down')
+    if (options.complete === 'ok') return { value: { isAnswered: true, text: '要約: 1 件失敗 src/a.ts:42 error TS2322: boom', usage } }
+    if (options.complete === 'long') return { value: { isAnswered: true, text: 'x'.repeat(3001), usage } }
     return { value: { isAnswered: false, reason: 'api-error', status: 500, error: 'server_error', usage } }
   })
   on('tool.call', { tool: 'TaskStop' }, (_$: any, e: any) => { w.stopped.push(e.task_id); w.live.delete(e.task_id); return { result: { message: 'stopped' }, text: 'stopped' } })
   on('tool.call', (_$: any, e: any) => {
     w.calls.push(e.tool)
     if (e.tool === 'Bash') w.bash.push(e.command)
+    const out = options.bashOut
+    if (e.tool === 'Bash' && out) {
+      const ro = out.isReadOnly ? { isReadOnly: true } : {}
+      if (out.isError) return { isError: true, result: `Exit code 3\n${out.stdout}`, text: `Exit code 3\n${out.stdout}`, ...ro }
+      const persisted = out.persisted ? { persistedOutputPath: out.persisted, persistedOutputSize: out.stdout.length } : {}
+      return { result: { stdout: out.persisted ? out.stdout.slice(0, 100) : out.stdout, stderr: '', interrupted: false, ...persisted }, text: out.stdout, ...ro }
+    }
     return { result: 'ok', text: 'ok' }
   })
   on('process.run', async (_$: any, e: any) => {
@@ -1793,4 +1811,147 @@ test('savings: a probe call of a subagent, or one without its id, gets no line',
   await probe($, { questions: ['q'] })
   await ($.turn.complete as any)({ turnId: 't', answer: '', durationMs: 1, isAborted: false, reason: 'answer' })
   expect((await seen($, 'toolu_p')).line).toBe(undefined)
+})
+
+// ------------------------------------------------------------------ condensing the parent's Bash (save mode)
+
+const bigOut = Array.from({ length: 300 }, (_, i) => (i === 150 ? 'src/a.ts:42 error TS2322: boom' : `line ${i + 1} passed`)).join('\n')
+const PROJECT = '/home/u/.claude/projects/-p'
+const TRANSCRIPT = { [`${PROJECT}/S1.jsonl`]: '' }
+const KEPT = `${PROJECT}/S1/probe-outputs/toolu_1.txt`
+// The conversation as the next request carries it (Messages API form), the Bash being summarized last.
+const API_TALK = [
+  { role: 'user', content: '<system-reminder>REMINDER</system-reminder>テストを直して' },
+  { role: 'assistant', content: [{ type: 'thinking', thinking: 'SECRET-PLAN' }, { type: 'text', text: '直します。' }, { type: 'tool_use', id: 'toolu_0', name: 'Edit', input: { file_path: 'src/a.ts' } }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_0', content: [{ type: 'text', text: 'EDITED' }] }] },
+  { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'npm test' } }] },
+]
+const saveMode = async ($: any) => {
+  await start($)
+  await ($.command.run as any)({ command: 'probe-mode', args: 'save' })
+}
+const bashCall = ($: any, input: Record<string, unknown> = {}) => asAgent($, undefined, { tool: 'Bash', tool_use_id: 'toolu_1', command: 'npm test', description: 'Run the tests', ...input })
+
+test('condense: in save mode a long output comes back as the summary, the original in a file beside the transcript', async ($, on) => {
+  const w = world($, on, { bashOut: { stdout: bigOut }, complete: 'ok', messages: API_TALK, files: { ...TRANSCRIPT } })
+  mock.store(on)
+  await saveMode($)
+  const r = await bashCall($)
+  expect(r.result.stdout).toBe(condensedBody('要約: 1 件失敗 src/a.ts:42 error TS2322: boom', { lines: 300, n: bigOut.length, path: KEPT }))
+  expect(r.result.stdout).toContain('原文から知りたいことを probe に頼む')
+  expect(r.result.stderr).toBe('')
+  expect(w.writes).toEqual([{ path: KEPT, text: bigOut }])
+  expect(w.bash).toEqual(['npm test'])
+  expect(w.completes.length).toBe(1)
+  const ask = w.completes[0]
+  expect(ask.model).toBe('haiku')
+  expect(ask.system).toBe(CONDENSE_SYSTEM)
+  expect(ask.prompt).toContain('テストを直して')
+  expect(ask.prompt).toContain('### Edit の呼び出し')
+  expect(ask.prompt).toContain('EDITED')
+  expect(ask.prompt).toContain('description: Run the tests')
+  expect(ask.prompt).toContain('src/a.ts:42 error TS2322: boom')
+  expect(ask.prompt).not.toContain('SECRET-PLAN')
+  expect(ask.prompt).not.toContain('REMINDER')
+  expect(w.messageCalls).toEqual([{ as: 'api' }])
+})
+
+test('condense: off in handy mode, for a short or read-only output, a subagent\'s Bash or one in the background', async ($, on) => {
+  const w = world($, on, { bashOut: { stdout: bigOut }, complete: 'ok', files: { ...TRANSCRIPT } })
+  mock.store(on)
+  await start($) // handy, the default
+  expect((await bashCall($)).result.stdout).toBe(bigOut)
+  await ($.command.run as any)({ command: 'probe-mode', args: 'save' })
+  expect((await bashCall($, { run_in_background: true })).result.stdout).toBe(bigOut)
+  expect((await asAgent($, 'other-1', { tool: 'Bash', command: 'npm test' })).result.stdout).toBe(bigOut)
+  expect(w.completes.length).toBe(0)
+  expect(w.writes.length).toBe(0)
+})
+
+test('condense: a read-only call as run, or a short output, is left as it was', async ($, on) => {
+  const w = world($, on, { bashOut: { stdout: bigOut, isReadOnly: true }, complete: 'ok', files: { ...TRANSCRIPT } })
+  mock.store(on)
+  await saveMode($)
+  expect((await bashCall($, { command: 'cat big.log' })).result.stdout).toBe(bigOut)
+  expect(w.completes.length).toBe(0)
+})
+
+test('condense: a short output is left as it was, without a model call', async ($, on) => {
+  const w = world($, on, { bashOut: { stdout: 'short' }, complete: 'ok', files: { ...TRANSCRIPT } })
+  mock.store(on)
+  await saveMode($)
+  expect((await bashCall($)).result.stdout).toBe('short')
+  expect(w.completes.length).toBe(0)
+})
+
+for (const complete of [undefined, 'long', 'throw'] as const) {
+  test(`condense: a summary that is not had (${complete ?? 'api-error'}) leaves the output, the command run once`, async ($, on) => {
+    const w = world($, on, { bashOut: { stdout: bigOut }, complete, files: { ...TRANSCRIPT } })
+    mock.store(on)
+    await saveMode($)
+    expect((await bashCall($)).result.stdout).toBe(bigOut)
+    expect(w.bash.length).toBe(1)
+    expect(w.writes.length).toBe(0)
+  })
+}
+
+test('condense: an original that cannot be written leaves the output as it was', async ($, on) => {
+  const w = world($, on, { bashOut: { stdout: bigOut }, complete: 'ok', files: { ...TRANSCRIPT }, writeFails: true })
+  mock.store(on)
+  await saveMode($)
+  expect((await bashCall($)).result.stdout).toBe(bigOut)
+  expect(w.bash.length).toBe(1)
+})
+
+test('condense: an error result stays an error', async ($, on) => {
+  const w = world($, on, { bashOut: { stdout: bigOut, isError: true }, complete: 'ok', files: { ...TRANSCRIPT } })
+  mock.store(on)
+  await saveMode($)
+  const r = await bashCall($)
+  expect(r.isError).toBe(true)
+  expect(r.result.stdout).toContain('要約: ')
+  expect(r.text).toBe(r.result.stdout)
+  expect(w.completes[0].prompt).toContain('Exit code 3')
+})
+
+test('condense: an output core persisted is read whole and named where it is', async ($, on) => {
+  const persisted = `${PROJECT}/S1/tool-results/toolu_1.txt`
+  const v = world($, on, { bashOut: { stdout: bigOut, persisted }, complete: 'ok', files: { ...TRANSCRIPT, [persisted]: bigOut } })
+  mock.store(on)
+  await saveMode($)
+  const p = await bashCall($)
+  expect(p.result.stdout).toContain(`、${persisted} にある`)
+  expect(p.result.persistedOutputPath).toBeUndefined()
+  expect(v.writes.length).toBe(0)
+  expect(v.completes[0].prompt).toContain('line 300 passed')
+})
+
+test('conversationText: all text first, newest first; tool calls in what is left, each cut, then bare, then none', () => {
+  const items = conversationItems(API_TALK, 'toolu_1')
+  expect(items.map((i: any) => i.kind)).toEqual(['text', 'text', 'tool'])
+  expect(items[2]).toMatchObject({ name: 'Edit', result: 'EDITED', isError: false })
+  expect(conversationText(items, 10000)).toBe('### user\nテストを直して\n\n### assistant\n直します。\n\n### Edit の呼び出し\n入力: {"file_path":"src/a.ts"}\n結果: EDITED')
+  const long = [{ kind: 'text', role: 'user', body: 'u'.repeat(50) }, { kind: 'tool', name: 'Bash', input: '{}', result: 'r'.repeat(5000), isError: true }, { kind: 'text', role: 'assistant', body: 'a'.repeat(50) }]
+  const cut = conversationText(long, 3000)
+  expect(cut).toContain('結果（エラー）: ' + 'r'.repeat(990))
+  expect(cut).toContain('字を省略')
+  expect(conversationText(long, 200)).toContain('結果（エラー）: （省略）')
+  expect(conversationText(long, 140)).toBe(`…（上限のため、ツールの呼び出し 1 件を省略）\n\n### user\n${'u'.repeat(50)}\n\n### assistant\n${'a'.repeat(50)}`)
+  const older = conversationText(long, 70) // the newest text alone fits: the older text goes, and the call (newer) does not fit
+  expect(older).toBe(`…（上限のため、古い 1 件とツールの呼び出し 1 件を省略）\n\n### assistant\n${'a'.repeat(50)}`)
+  const one = conversationText([{ kind: 'text', role: 'user', body: 'x'.repeat(500) + 'END' }], 100)
+  expect(one.startsWith('### user\n…（先頭を省略）')).toBe(true)
+  expect(one.endsWith('END')).toBe(true)
+  expect(Array.from(one).length).toBeLessThanOrEqual(100)
+})
+
+test('condensePrompt: the conversation, then the command and the output; past CONDENSE_SOURCE_CHARS the middle goes', () => {
+  const huge = 'h'.repeat(30000) + 'MIDDLE' + 't'.repeat(30000)
+  const p = condensePrompt({ items: [], command: 'make', description: '', output: huge })
+  expect(p.startsWith('## 依頼主の会話\n（なし）\n\n## 実行したコマンド\ndescription: （なし）\nmake')).toBe(true)
+  expect(p).toContain('## 出力（60006 字。長いので中ほどを省いた）')
+  expect(p).not.toContain('MIDDLE')
+  expect(Array.from(p).length + Array.from(CONDENSE_SYSTEM).length).toBeLessThanOrEqual(70000)
+  expect(headTail('a'.repeat(50) + 'b'.repeat(50), 40).startsWith('a'.repeat(10))).toBe(true)
+  expect(CONDENSE_SYSTEM).toContain('依頼主の考え（thinking）は含まない')
 })
