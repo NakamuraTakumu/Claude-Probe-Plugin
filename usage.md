@@ -27,11 +27,11 @@ probe を使う流れの順に、何を頼むか、どう頼むか、答えを�
    probe(questions: ["記録 ~/.claude/projects/-p/abc.jsonl から、X の移行についてユーザーが決めたことを引用で返す", "X の v2 で変わった API を Web で調べ、出典の URL つきで返す", "src/ で X の v1 の API を使っている箇所を、ファイル:行と原文の引用で返す"], max_chars: 3000)
    ```
    決めたこと 2 点、変わった API 3 つ、使っている 4 か所が返る。4 か所を、それぞれ前後だけ Read して書き換える。
-2. ビルドが失敗した。長い出力は Haiku の要約に差し替わって返り、src/net/client.ts:88 の型エラーが引用されている。型が合わない理由は要約にないので、要約の末尾にある原文のファイルについて頼む。
+2. ビルドの出力が長すぎて /tmp/…/b1.txt に保存された。そのファイルは自分で読まずに頼む。
    ```
-   probe(questions: ["…/probe-outputs/toolu_01.txt はビルドの出力。src/net/client.ts:88 の型エラーについて、期待された型と実際の型を示す行を引用で返す"], context: false)
+   probe(questions: ["/tmp/…/b1.txt はビルドの出力。最初のエラーと、それが指すソースの箇所を、ファイル:行と引用で返す"], context: false)
    ```
-   戻り値が Promise に変わったと分かる。その前後を Read して直す。
+   src/net/client.ts:88 の型エラーと分かる。その前後を Read して直す。
 3. テストで「retries after timeout」が落ちた（期待 3、実際 0）。分かったことを問いに書いて、原因の切り分けを頼む。
    ```
    probe(questions: ["npm test で「retries after timeout」が落ちた（期待 3、実際 0）。X の v2 でリトライの既定がどう変わったかと、このリポジトリで設定している箇所を切り分け、出典の URL とファイル:行で返す"], context: false, effort: "medium")

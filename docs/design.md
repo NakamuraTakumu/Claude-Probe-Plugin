@@ -36,16 +36,8 @@ probe は、読み取り専用の調べものツール `probe` を、セッシ�
   - `prompt.submit`（origin が peer など）：`{ drop }`。
   - `session.append`（上の origin と task-notification、または door が attachment/delivery）：行は拒否できないので、本文を1行のスタブに置き換え、そのスタブを `prompt.attachment` が外す。走っているターンに届く完了の task-notification も `queued_command` の添付になるので、同じようにスタブにする。ただし、エンジンが origin を task-notification とした行だけにする。ユーザーのメッセージも system-reminder に包まれていて、本文では通知と見分けられないため。
   - 送り主は agentId、またはエンジンが付けた名前で判定する（起動時に覚える）。完了の task-notification も、task-id がすべて probe のときだけ落とす。答えの受け取り（`turn.complete`）は影響を受けない。
-- 長い Bash の出力の要約（save モードだけ）：メインの会話の Bash のうち、読み取りだけでなく、裏で動かさないものの出力が 4000 字以上なら、Haiku（`$.model.complete`）の要約に差し替える。handy では要約しない。handy の usage は、正確に読む必要があるものを親が自分で読むことを認めているからである。
-  - 読み取りだけかどうか：Bash 自身の判定を使う。ただし結果の `isReadOnly` は、書き換えの後に実行した入力についての判定である。rtk の PreToolUse が `ls` を `rtk ls` に書き換えると、読むだけのコマンドにも付かなくなる（2.1.318 と rtk 0.50.0 で確認）。そこで実行の前に、モデルが書いたコマンドで `$.tool.check` に問い合わせる。問い合わせには PreToolUse が走らず、エンジンがその入力に付ける `isReadOnly` を、自分の `tool.check` フックで受け取る。結果の `isReadOnly` も見る。
-  - Haiku に渡すもの：会話、コマンドと description、出力。会話は `$.session.messages({ as: 'api' })`（次のリクエストに入る会話。圧縮の後は圧縮の要約から）を文に直したもので、thinking は含めない（Haiku 5.5 は Opus 5/5.5 の thinking を読めず、API が送信前に落とす）。
-  - 長さ：全体で 7 万字以内にする。字数をトークン数の代わりにして、Haiku の 10 万トークンの価格の境目より下に収めるためである。出力は 4 万字までで、超えると中ほどを省く。会話は残りの枠に、まず本文（ユーザーと親）を新しい順に入れ、入らない本文から先の古い側を省く。次に、ツールの呼び出しを新しい順に、入力 500 字・結果 2000 字に縮めて入れる。入らなければ結果を省き、それでも入らなければ呼び出しごと省く。
-  - 原文：会話の記録の隣（`<projects>/<slug>/<session>/probe-outputs/<tool_use_id>.txt`）に書く。エンジンが保存済み（`persistedOutputPath`）なら、そのファイルを使う。要約の末尾には、行数・字数・パスと「要約で足りなければ、原文から知りたいことを probe に頼む」を付ける。
-  - 要約が得られない（失敗、空、3000 字超）か、原文を書けないときは、元の出力をそのまま返す。
-  - fork にしない理由：親の fork を Haiku で走らせることはできる（`turn.step` でモデルを書き換える。2.1.318 で確認）。しかし fork のたびに、会話の部分を Haiku のキャッシュに書き直す。次の fork は、その書き込みを使えない。そのため、親の文脈が 10 万トークンを超えると、要約の費用が節約とほぼ同じになる。会話を文に直せば、同じ情報を上限つきで渡せる。
 - デバッグ用のトレース：環境変数 `PROBE_TRACE` にファイルの絶対パスを入れると、配送らしいもの（`<agent-message`、`<cross-session-message`、`[Subagent hand-back]`、`<task-notification>`、スタブ、`<tools-used-before-summary>` のどれかを含むもの）を、各フックが見たとおりに1行の JSON でそのファイルに追記する（hook、判定、type、door、origin、agentId、turnId、本文の先頭2000文字）。`prompt.attachment` は、種類を絞らないフック（hook は `prompt.attachment (any)`）でも、判定の前の文面を書き出す。環境変数がなければ、プラグインの保存領域（`~/.claude/plugins/store/probe_*.json`）の `trace` を読む。起動中のセッションには環境変数を渡せないので、こちらを使う（ファイルを書き換えたあと `/reload-plugins` をしたら効いた。しない場合は確かめていない）。どちらも未設定か空なら何もしない。
   - 同じファイルに、差し戻しの送信結果（`hook: rewrite`、`delivered`、失敗なら `reason`）も1行ずつ書く。
-  - 同じファイルに、出力の要約（`hook: condense`、出力とプロンプトの字数、入力トークン数、かかった時間、原文のパス、失敗なら `reason`）も1行ずつ書く。
 
 ## 手元のディレクトリから読み込む
 
