@@ -76,7 +76,7 @@ const USAGE_MARK = /^<!--\s*(save|handy|all)\s*-->$/
 const USAGE_SCOPE = '（mcp__probe__probe を呼べないなら、この節は当てはまらない。）'
 const BACKGROUND_CHARS = 1500
 
-const MAX_PARALLEL = 4
+const MAX_PARALLEL = 16 // a call's subagents at once; the session's cap (CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS) holds too
 const QUESTION_TIMEOUT_MS = 15 * 60 * 1000
 const DEFAULT_MAX_CHARS = 2000
 const MIN_MAX_CHARS = 500
@@ -809,6 +809,11 @@ async function backgroundOf($, agentId) {
 
 // ---------------------------------------------------------------- the probe tool
 
+/** A spawn refused for the session's cap on subagents at once, in the engine's words ($.agent.spawn's, the Agent tool's). */
+export function atCapacity(deny) {
+  return /spawns are running at once|Concurrent subagent limit reached/.test(String(deny ?? ''))
+}
+
 async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
   const bad = validate(e)
   if (bad) return { deny: bad }
@@ -823,6 +828,7 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
   // agentId -> { index, deadline, hardDeadline (from the spawn, rewrites included), revisions,
   //              last (last good answer), rewriting (a delivered rewrite is out) }
   const running = new Map()
+  let waitFrom // since when the next question has found the session's cap full with none of this call's running
   activeRuns++
   try {
     for (;;) {
@@ -886,7 +892,7 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
         }
       }
       while (running.size < MAX_PARALLEL && queue.length > 0) {
-        const index = queue.shift()
+        const index = queue[0]
         const question = e.questions[index]
         let res
         try {
@@ -901,9 +907,19 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
           res = { deny: String(err) }
         }
         if (res.deny !== undefined || !res.agentId) {
+          // The session's cap on subagents at once (this call's and others', a parallel probe call's say): the
+          // question waits for one to finish, up to the question time when none of this call's is running.
+          if (atCapacity(res.deny)) {
+            if (running.size > 0) break
+            waitFrom ??= now
+            if (now - waitFrom < timeoutMs) break
+          }
+          queue.shift()
           results[index] = { ok: false, text: `ERROR: 開始できなかった: ${res.deny ?? 'agentId がない'}` }
           continue
         }
+        queue.shift()
+        waitFrom = undefined
         probeAgents.add(res.agentId)
         requesters.set(res.agentId, e.agentId ?? null)
         while (requesters.size > REQUESTERS_CAP) requesters.delete(requesters.keys().next().value)

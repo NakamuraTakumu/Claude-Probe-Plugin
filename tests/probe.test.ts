@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { recordRows, requestsOf, savingsOf, savingsLine, probeGroupOf } from '../hooks/register.js'
+import { atCapacity } from '../hooks/register.js'
 import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, BASH_DEFAULT_TIMEOUT_MS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, escapeMarks, SANDBOXES, WRAPUP_DENY, wrapupRequest, onlyStubs, shQuote, stopSeconds, stoppedNote, taskIdsOf, wrapCommand } from '../hooks/register.js'
 
 const AGENT = 'probe:probe'
@@ -14,7 +15,7 @@ type Script = { answer?: string; reason?: string; parks?: number; never?: boolea
  * its next run follows `then` of its script), the `sleep` park (the subagents finish
  * there, by script), bwrap, TaskStop and the clock.
  */
-function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; sleep?: boolean; send?: 'refuse' | 'throw'; messages?: any[] | 'throw' | 'deny'; usage?: string | 'missing'; sleepFails?: number; script?: (prompt: string, n: number) => Script; agents?: any[]; listThrows?: boolean; clockThrows?: boolean; names?: Record<string, string>; trace?: boolean; files?: Record<string, string> } = {}) {
+function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; sleep?: boolean; send?: 'refuse' | 'throw'; messages?: any[] | 'throw' | 'deny'; usage?: string | 'missing'; sleepFails?: number; script?: (prompt: string, n: number) => Script; agents?: any[]; listThrows?: boolean; clockThrows?: boolean; names?: Record<string, string>; trace?: boolean; files?: Record<string, string>; cap?: number } = {}) {
   if (options.clockThrows) on('clock.now', () => { throw new Error('boom') })
   const w = {
     clock: options.clockThrows ? (undefined as any) : mock.clock(on),
@@ -27,6 +28,7 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
     sends: [] as Array<{ to: unknown; text: string; origin: unknown }>,
     completes: [] as any[],
     maxLive: 0,
+    refused: 0,
     stopped: [] as string[],
     bash: [] as string[],
     calls: [] as string[],
@@ -92,6 +94,11 @@ function world($: any, on: any, options: { bwrap?: boolean; seatbelt?: boolean; 
   // The plugin's $.agent.spawn reaches the bottom as the Agent tool call (run_in_background) and reads
   // the tool's record ({ agentId, status: 'async_launched' }) from the answer's `result`.
   on('agent.spawn', (_$: any, e: any) => {
+    // The session's cap on subagents at once: the engine throws past it, which the plugin reads as this deny.
+    if (options.cap !== undefined && w.live.size >= options.cap) {
+      w.refused++
+      return { deny: `Error: probe: $.agent.spawn refused: ${options.cap} spawns are running at once` }
+    }
     const n = w.spawns.length + 1
     const s = script(e.prompt.replace(/\n\n（結果の上限: \d+ 字）$/, ''), n)
     w.spawns.push(e)
@@ -211,7 +218,7 @@ test('session.start registers the hidden probe agent and the probe tool', async 
       '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれ、見つからなかったときは探した範囲が書かれる。〔〕 は probe が付ける印。',
   )
   expect(Object.keys(t.inputSchema.properties)).toEqual(['questions', 'cwd', 'max_chars', 'context', 'effort'])
-  expect(t.inputSchema.properties.questions.description).toContain('複数書くと並列に処理され、結果はまとめて返る（最大4件同時')
+  expect(t.inputSchema.properties.questions.description).toContain('複数書くと並列に処理され、結果はまとめて返る（最大16件同時')
   expect(t.inputSchema.properties.questions.description).toContain('同じディレクトリでビルドする問いは並べない')
   expect(t.inputSchema.properties.cwd.description).toBe('実行ディレクトリ。省略すると現在の作業ディレクトリ。')
   expect(t.inputSchema.properties.max_chars.description).toContain('500〜8000')
@@ -254,13 +261,35 @@ test('probe: the children always run on haiku, a model argument is refused; no c
   expect('cwd' in w.spawns[0] && w.spawns[0].cwd !== undefined).toBe(false)
 })
 
-test('probe: at most 4 subagents at a time, the rest wait for a free place', async ($, on) => {
+test('probe: at most 16 subagents at a time, the rest wait for a free place', async ($, on) => {
   const w = world($, on, { script: () => ({ answer: 'ok', parks: 2 }) })
   await start($)
-  const r = await probe($, { questions: ['a', 'b', 'c', 'd', 'e', 'f'] })
-  expect(w.spawns.length).toBe(6)
-  expect(w.maxLive).toBe(4)
-  expect(r.result).toBe(['1', '2', '3', '4', '5', '6'].map((i) => `〔問い ${i}〕\nok`).join('\n\n'))
+  const qs = Array.from({ length: 18 }, (_, i) => `q${i + 1}`)
+  const r = await probe($, { questions: qs })
+  expect(w.spawns.length).toBe(18)
+  expect(w.maxLive).toBe(16)
+  expect(r.result).toBe(qs.map((_, i) => `〔問い ${i + 1}〕\nok`).join('\n\n'))
+})
+
+test('probe: a spawn refused for the session\'s cap waits for a running subagent, then starts', async ($, on) => {
+  const w = world($, on, { script: () => ({ answer: 'ok', parks: 2 }), cap: 2 })
+  await start($)
+  const r = await probe($, { questions: ['a', 'b', 'c', 'd', 'e'] })
+  expect(w.maxLive).toBe(2)
+  expect(w.spawns.length).toBe(5)
+  expect(w.refused).toBeGreaterThan(0)
+  expect(r.result).toBe(['1', '2', '3', '4', '5'].map((i) => `〔問い ${i}〕\nok`).join('\n\n'))
+})
+
+test('probe: with the cap held by others the whole question time, the question fails with the engine\'s reason', async ($, on) => {
+  const w = world($, on, { cap: 0 })
+  await start($)
+  const r = await probe($, { questions: ['a'] })
+  expect(r.deny).toContain('ERROR: 開始できなかった')
+  expect(r.deny).toContain('spawns are running at once')
+  expect(w.refused).toBeGreaterThan(10) // tried again each park (a minute) for 15 minutes
+  expect(atCapacity('Concurrent subagent limit reached. You can run 8 subagents at once.')).toBe(true)
+  expect(atCapacity('nobody by that name')).toBe(false)
 })
 
 test('probe: a failed task shows its error in its own section, the others stay', async ($, on) => {
