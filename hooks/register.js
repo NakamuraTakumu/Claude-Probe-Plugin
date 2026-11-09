@@ -20,6 +20,10 @@
 //                       it starts are refused the context tool.
 //   effort              (input of a probe call) low ... max: turn.step puts it on each model request of
 //                       the children that call started (a spawn takes no effort; AGENT_SPEC's is the default).
+//   run                 (input of a probe call) { name, input }: a tool run once before the questions, as the
+//                       caller's own call ($.tool.call: the other hooks, the permission check, then the tool).
+//                       Its result as the model reads it heads the answer, unshortened, and each question's
+//                       subagent is handed it. A deny (permission refused) is the call's deny: no question runs.
 //   mcp__probe__context tool of the probe subagents only: reads the conversation of whoever called
 //                       probe (user/assistant text, no tool output). Not hideable from the parent
 //                       (no tool.offer): placed behind ToolSearch, described as probe-internal, and
@@ -91,6 +95,9 @@ const WRAPUP_TIMEOUT_MS = 2 * 60 * 1000 // a question past its time is asked for
 const HANDBACK_TOOL = 'SubagentHandback' // how a subagent hands its answer back: neither refused nor listed
 const COMPLETIONS_CAP = 256
 const CHILD_MODEL = 'haiku' // probe always runs on haiku
+// Keys of a tool call's input that are the engine's, not the tool's (ToolCallReserved, AgentLoop): a `run` input may
+// not set them (`consent` would speak for the person).
+const RESERVED_INPUT_KEYS = ['tool', 'tool_use_id', 'consent', 'agentId']
 
 // Bash of a probe subagent runs inside the first of SANDBOXES whose check runs here (checked once per probe call):
 // the file system read-only, no network, temp files (mktemp) only for the command's own run. Its calls run
@@ -137,6 +144,7 @@ export const TOOL_SPEC = {
   name: 'probe',
   description:
     '読み取り専用のシェルで調べて、結論か関係する原文の引用だけを返す。ファイルの検索、コマンドやテストの実行、Web 検索ができ、条件を明示すれば分岐を含む手順も任せられる。' +
+    'ツールを1つ先に実行させると、その結果を加工せずに返したうえで、その結果から続けて調べる。' +
     '向くのは、どこにあるか分からないものを広く探すとき、多くのファイルにまたがるとき、長い出力（ログ、コマンドの出力）から要点だけ欲しいとき、Web で調べるとき。' +
     '判断は、基準を問いに書けるなら任せられる。会話全体の文脈や好みに依る判断は任せず、材料集めに使う。' +
     '答えの事実はそのまま使ってよい。確かめていない推測には「推測」と書かれ、見つからなかったときは探した範囲が書かれる。〔〕 は probe が付ける印。',
@@ -161,6 +169,18 @@ export const TOOL_SPEC = {
         description: 'false なら依頼主の会話を渡さず、問いだけを渡す（省略すると true）。渡すのは直近の数往復の本文だけで、ツールの結果は渡らないので、前の結果で分かったパスや名前は問いに書く。問いだけで足りるなら false にする（会話に引きずられず、安い）。',
       },
       effort: { type: 'string', enum: EFFORTS, description: '調べる側の考える深さ（省略すると low）。手順の多い調べものや、難しい判断には medium 以上。' },
+      run: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'ツールの名前（Bash、Read、mcp__server__tool など）。' },
+          input: { type: 'object', description: 'そのツールの入力。' },
+        },
+        required: ['name', 'input'],
+        additionalProperties: false,
+        description:
+          '問いの前に1回実行するツール。権限の確認は自分で呼んだときと同じで、cwd は効かない。結果は加工されずに答えの前に返り、問いはその結果を見たうえで調べられる。' +
+          '結果を自分でも見たいが、結果によっては続けて調べることになりそうなとき（ビルドやテストの失敗の原因、出力の照合など）に使う。',
+      },
     },
     required: ['questions'],
     additionalProperties: false,
@@ -245,12 +265,32 @@ export function lengthOf(text) {
 
 /**
  * The question as the subagent gets it: the recent conversation of whoever asked, as "## 背景" (when
- * there is one), then "## 質問" with the question, then its own upper bound. Without a background the
- * question stands alone.
+ * there is one), the tool the call ran first and its result (when it names one), then "## 質問" with the
+ * question, then its own upper bound. With neither the question stands alone.
  */
-export function questionPrompt(question, maxChars = DEFAULT_MAX_CHARS, background) {
+export function questionPrompt(question, maxChars = DEFAULT_MAX_CHARS, background, ran) {
   const limit = `（結果の上限: ${maxChars} 字）`
-  return background ? `## 背景（依頼主との直近の会話）\n${background}\n\n## 質問\n${question}\n\n${limit}` : `${question}\n\n${limit}`
+  const before = []
+  if (background) before.push(`## 背景（依頼主との直近の会話）\n${background}`)
+  if (ran) before.push(ranSection(ran))
+  return before.length === 0 ? `${question}\n\n${limit}` : [...before, `## 質問\n${question}`, limit].join('\n\n')
+}
+
+/** What the call's tool was and what it gave, for the subagent: its requester gets that result as it is. */
+export function ranSection(ran) {
+  return [
+    '## 依頼主が先に実行したツール',
+    '依頼主はこのツールを実行し、結果をそのまま受け取っている。結果を答えに写さず、その先を答える。',
+    `ツール: ${ran.name}`,
+    `入力: ${JSON.stringify(ran.input)}`,
+    `結果${ran.isError ? '（エラー）' : ''}:`,
+    `<result>\n${ran.text}\n</result>`,
+  ].join('\n')
+}
+
+/** The heading of the tool's result in the answer. */
+function ranHeading(ran) {
+  return `〔${escapeMarks(ran.name)} の結果${ran.isError ? '（エラー）' : ''}〕`
 }
 
 /** The deny of a probe call whose hook failed, with why (the `next.error` its `.catch` is given). */
@@ -291,11 +331,13 @@ function fit(text, max, why) {
 /**
  * One result: its text alone, no heading. Two or more: `〔問い 1〕`, `〔問い 2〕` ... one section per
  * question, in question order. No file path lines. An answer above `maxChars` is cut (marked).
+ * With the tool the call ran first (`ran`): its result, uncut, under `〔<tool> の結果〕`, then every answer
+ * under its `〔問い N〕`, one too.
  */
-export function formatResults(results, maxChars = DEFAULT_MAX_CHARS) {
+export function formatResults(results, maxChars = DEFAULT_MAX_CHARS, ran) {
   const body = (r) => fit(r ? r.text : 'ERROR: 結果なし', maxChars, r && r.why)
-  if (results.length === 1) return body(results[0])
-  return results.map((r, i) => `〔問い ${i + 1}〕\n${body(r)}`).join('\n\n')
+  const answers = results.length === 1 && !ran ? body(results[0]) : results.map((r, i) => `〔問い ${i + 1}〕\n${body(r)}`).join('\n\n')
+  return ran ? `${ranHeading(ran)}\n${escapeMarks(ran.text)}\n\n${answers}` : answers
 }
 
 const SYSTEM_REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g
@@ -477,7 +519,37 @@ function validate(e) {
   if (e.max_chars !== undefined && (!Number.isInteger(e.max_chars) || e.max_chars < MIN_MAX_CHARS || e.max_chars > MAX_MAX_CHARS)) {
     return `max_chars は ${MIN_MAX_CHARS} 以上 ${MAX_MAX_CHARS} 以下の整数にする。`
   }
+  if (e.run !== undefined) return validateRun(e.run)
   return undefined
+}
+
+function validateRun(t) {
+  const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
+  if (!isObject(t) || typeof t.name !== 'string' || !t.name.trim() || !isObject(t.input)) {
+    return 'run は { name: ツールの名前, input: その入力（オブジェクト） } にする。'
+  }
+  if (Object.keys(t).some((k) => k !== 'name' && k !== 'input')) return 'run に書けるのは name と input だけ。'
+  if (t.name === PROBE_TOOL || t.name === CONTEXT_TOOL) return `run に ${t.name} は指定できない。`
+  const reserved = RESERVED_INPUT_KEYS.filter((k) => Object.hasOwn(t.input, k))
+  if (reserved.length > 0) return `run の input に ${reserved.join(', ')} は書けない。`
+  if (t.input.run_in_background === true) return 'run のツールは終わるのを待つ形で実行する（run_in_background は使えない）。'
+  return undefined
+}
+
+/**
+ * Runs the call's `run` tool once, as its caller's own call (the loop the probe call runs in): the other hooks,
+ * the permission check, then the tool. `{ name, input, text, isError }`, or `{ deny }` when it did not run.
+ */
+async function runFirst($, tool) {
+  let r
+  try {
+    r = await $.tool.call({ ...tool.input, tool: tool.name })
+  } catch (err) {
+    return { deny: `${tool.name} を実行できなかった: ${err && err.message ? err.message : String(err)}` }
+  }
+  if (r.deny !== undefined) return { deny: `${tool.name} は実行されなかった: ${r.deny}` }
+  const text = typeof r.text === 'string' ? r.text : JSON.stringify(r.result ?? null)
+  return { name: tool.name, input: tool.input, text, isError: r.isError === true }
 }
 
 // ---------------------------------------------------------------- module state
@@ -821,6 +893,8 @@ export function atCapacity(deny) {
 async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
   const bad = validate(e)
   if (bad) return { deny: bad }
+  const ran = e.run === undefined ? undefined : await runFirst($, e.run)
+  if (ran && ran.deny !== undefined) return { deny: signal && signal.aborted ? 'probe は中断された。' : ran.deny }
   const model = CHILD_MODEL
   const maxChars = e.max_chars ?? DEFAULT_MAX_CHARS
   const background = e.context === false ? undefined : await backgroundOf($, e.agentId)
@@ -901,7 +975,7 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
         let res
         try {
           res = await $.agent.spawn({
-            prompt: questionPrompt(question, maxChars, background),
+            prompt: questionPrompt(question, maxChars, background, ran),
             description: 'probe: ' + question.replace(/\s+/g, ' ').slice(0, 40),
             subagentType: AGENT_TYPE,
             model,
@@ -946,8 +1020,9 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
     for (const r of running.values()) closeWindow(r)
     for (const id of running.keys()) await stopAgent($, id)
   }
-  const text = formatResults(results, maxChars)
-  if (results.every((r) => !r.ok)) return { deny: 'probe: すべての問いが失敗した。\n' + text }
+  const text = formatResults(results, maxChars, ran)
+  // With a tool that ran, its result is the caller's even when every question failed.
+  if (!ran && results.every((r) => !r.ok)) return { deny: 'probe: すべての問いが失敗した。\n' + text }
   return { result: text }
 }
 
