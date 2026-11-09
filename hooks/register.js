@@ -4,12 +4,14 @@
 //   probe:probe         agent type (hidden from the model by agent.offer)
 //   mcp__probe__probe   tool the parent calls; one hidden subagent per question
 //   tool description    what probe is and when it fits: every loop that is offered the tool reads it.
-//   prompt.section      appends usage.md (the user's rules for probe, beyond the description) to the system
-//                       prompt section `env_info_model`, the one section that the main conversation, the
-//                       subagents the model starts and the probe subagents all carry (prompt.compose renders
-//                       the main one's only): the same text in the same place everywhere. A line under its
-//                       heading sets it aside where probe is not on offer (a probe subagent reads it too). It
-//                       replaces an `@` import of the file in CLAUDE.md, and follows the plugin on and off.
+//   prompt.attachment   appends usage.md (the user's rules for probe, beyond the description) to the engine's
+//   (type model)        model attachment ("You are powered by the model named …"), which the main conversation
+//                       and every subagent carry: the same text in the same place everywhere, but none in a
+//                       probe subagent (it cannot call probe). The answer is asked again after $.ui.invalidate,
+//                       a compaction and a resume in a new process, so a running session gets a changed
+//                       usage.md or mode; the system prompt section env_info_model that carried the rules
+//                       before is made once per session and stored. It replaces an `@` import of the file in
+//                       CLAUDE.md, and follows the plugin on and off.
 //   /probe-mode        save | handy: which lines of usage.md go in (a line `<!-- save -->` or
 //                       `<!-- handy -->` starts lines of that mode only, `<!-- all -->` ends them).
 //                       Kept in $.store for later sessions; this session's prompt changes next request.
@@ -66,14 +68,16 @@ const CONTEXT_GREP_MAX = 200
 const REQUESTERS_CAP = 512
 const BACKGROUND_USER_TURNS = 3
 const USAGE_FILE = 'usage.md'
-const USAGE_SECTION = 'env_info_model'
+const USAGE_ATTACHMENT = 'model'
+// The heading of every usage.md so far: probe 0.4.0 and before wrote the rules into the section env_info_model,
+// whose text the model attachment stores; from it on, that text is taken out before the rules go in again.
+const STORED_USAGE_HEADING = '# probe の使い分け'
 const MODES = ['save', 'handy']
 const DEFAULT_MODE = 'handy'
 const MODE_KEY = 'mode'
 const MODE_COMMAND = 'probe-mode'
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 const USAGE_MARK = /^<!--\s*(save|handy|all)\s*-->$/
-const USAGE_SCOPE = '（mcp__probe__probe を呼べないなら、この節は当てはまらない。）'
 const BACKGROUND_CHARS = 1500
 
 const MAX_PARALLEL = 16 // a call's subagents at once; the session's cap (CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS) holds too
@@ -701,15 +705,15 @@ function closeWindow(r) {
 
 // ---------------------------------------------------------------- the usage rules
 
-/**
- * A section's text with the usage rules after it. The line that sets them aside where probe is not on
- * offer comes first (after their heading, if they open with one): a probe subagent gets the rules too
- * (prompt.section does not say whose prompt it is), and learns at once that they are not for it.
- */
+/** The model attachment's text with the usage rules after it. */
 export function withUsage(text, usage) {
-  const [first, ...rest] = String(usage).split('\n')
-  const lines = /^#/.test(first) ? [first, USAGE_SCOPE, ...rest] : [USAGE_SCOPE, first, ...rest]
-  return `${text}\n\n${lines.join('\n')}`
+  return `${text}\n\n${usage}`
+}
+
+/** The model attachment's text without the rules an older probe stored in it (from their heading on). */
+export function withoutStoredUsage(text) {
+  const at = String(text).indexOf(`\n\n${STORED_USAGE_HEADING}\n`)
+  return at < 0 ? text : text.slice(0, at)
 }
 
 /**
@@ -760,7 +764,7 @@ async function usageOf($) {
 async function switchSetting($, { command, key, values, current, set }, args) {
   usageText = undefined // read again on the next request
   try {
-    $.ui.invalidate('prompt.section') // the section is cached until then
+    $.ui.invalidate('prompt.attachment') // the attachment's answer is kept until then
   } catch {}
   const want = String(args ?? '').trim()
   const choices = values.join(' か ')
@@ -1250,13 +1254,15 @@ export function register(on) {
     return next(e)
   })
 
-  // The rules for using probe go after the section env_info_model, which every system prompt carries:
-  // the main conversation's, a subagent's, a probe subagent's (see the header). A section core leaves
-  // out, a mode with no rules or a failure leaves it as core computed it.
-  on('prompt.section', { name: USAGE_SECTION }, async ($, e, next) => {
+  // The rules for using probe go after the model attachment of the main conversation and of each subagent but
+  // a probe subagent (see the header), in place of any an older probe stored in it. An attachment another
+  // hook left out stays out; a mode with no rules leaves none; a failure leaves the attachment as it came.
+  on('prompt.attachment', { type: USAGE_ATTACHMENT }, async ($, e, next) => {
     const r = await next(e)
-    const usage = typeof r.text === 'string' ? await usageOf($) : null
-    return usage ? { text: withUsage(r.text, usage) } : r
+    if (typeof r.text !== 'string') return r
+    const text = withoutStoredUsage(r.text)
+    const usage = e.agentId !== undefined && (await isProbeAgent($, e.agentId)) ? null : await usageOf($)
+    return { text: usage ? withUsage(text, usage) : text }
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: MODE_COMMAND }, ($, e) => switchSetting($, MODE_SETTING, e.args)).catch(($, e, next) => next(e))

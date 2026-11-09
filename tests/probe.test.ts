@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { recordRows, requestsOf, savingsOf, savingsLine, probeGroupOf } from '../hooks/register.js'
 import { atCapacity } from '../hooks/register.js'
-import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, BASH_DEFAULT_TIMEOUT_MS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, escapeMarks, SANDBOXES, WRAPUP_DENY, wrapupRequest, onlyStubs, shQuote, stopSeconds, stoppedNote, taskIdsOf, wrapCommand } from '../hooks/register.js'
+import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, BASH_DEFAULT_TIMEOUT_MS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, withoutStoredUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, escapeMarks, SANDBOXES, WRAPUP_DENY, wrapupRequest, onlyStubs, shQuote, stopSeconds, stoppedNote, taskIdsOf, wrapCommand } from '../hooks/register.js'
 
 const AGENT = 'probe:probe'
 const TOOL = 'mcp__probe__probe'
@@ -984,30 +984,52 @@ test('background: the instruction calls it a reference and points to the context
   }
 })
 
-// ------------------------------------------------------------------ the usage rules in the system prompt
+// ------------------------------------------------------------------ the usage rules in the model attachment
 
-// A section as core computed it, handed on to the prompt.section hooks.
-const section = ($: any, name: string, text: string | null) => ($.prompt.section as any)({ name, text })
-const rules = async ($: any) => (await section($, 'env_info_model', 'MODEL')).text
+// An engine attachment as a request is about to carry it, handed on to the prompt.attachment hooks.
+const attachment = ($: any, type: string, text: string | null, extra: Record<string, unknown> = {}) =>
+  ($.prompt.attachment as any)({ type, text, origin: { kind: 'engine' }, ...extra })
+const rules = async ($: any, text = 'MODEL', extra: Record<string, unknown> = {}) => (await attachment($, 'model', text, extra)).text
+// What a model attachment stores when probe 0.4.0 or before wrote the rules into the section env_info_model.
+const STORED = 'MODEL\n\n# probe の使い分け\n（mcp__probe__probe を呼べないなら、この節は当てはまらない。）\n\nold rules'
 
-test('usage: the section env_info_model gets the rules after its own text, and no other section does', async ($, on) => {
+test('usage: the model attachment gets the rules after its own text, and no other attachment does', async ($, on) => {
   const w = world($, on)
   await start($)
-  expect(await rules($)).toBe('MODEL\n\n（mcp__probe__probe を呼べないなら、この節は当てはまらない。）\nUSAGE-RULES\nwhen to use probe')
+  expect(await rules($)).toBe('MODEL\n\nUSAGE-RULES\nwhen to use probe')
   expect(await rules($)).toBe(withUsage('MODEL', 'USAGE-RULES\nwhen to use probe'))
-  // rules that open with a heading: the line goes right under it
-  expect(withUsage('MODEL', '# probe の使い分け\n\nbody')).toBe('MODEL\n\n# probe の使い分け\n（mcp__probe__probe を呼べないなら、この節は当てはまらない。）\n\nbody')
-  for (const name of ['env_info_simple', 'memory', 'communication']) expect((await section($, name, 'X')).text).toBe('X')
-  // asked again and again (each prompt of each loop): the same text, and the file was read once
+  for (const type of ['environment', 'date', 'skill_listing']) expect((await attachment($, type, 'X')).text).toBe('X')
+  // asked again (after an invalidation, a compaction, a resume): the same text, and the file was read once
   for (let i = 0; i < 3; i++) expect(await rules($)).toBe(withUsage('MODEL', 'USAGE-RULES\nwhen to use probe'))
   expect(w.reads.length).toBe(1)
   expect(w.reads[0]).toMatch(/\/usage\.md$/)
 })
 
-test('usage: a section core leaves out stays out, and usage.md is not even read', async ($, on) => {
+test('usage: the rules an older probe stored in the attachment give way to the ones of now', async ($, on) => {
+  world($, on)
+  await start($)
+  expect(await rules($, STORED)).toBe(withUsage('MODEL', 'USAGE-RULES\nwhen to use probe'))
+  expect(withoutStoredUsage(STORED)).toBe('MODEL')
+  expect(withoutStoredUsage('MODEL\n\nother text')).toBe('MODEL\n\nother text')
+})
+
+test("usage: a probe subagent's model attachment gets no rules (and loses stored ones); another subagent's gets them", async ($, on) => {
+  world($, on, {
+    agents: [
+      { id: 'kid', type: 'probe:probe', status: 'running', description: 'probe: a' },
+      { id: 'explorer', type: 'Explore', status: 'running', description: 'look around' },
+    ],
+  })
+  await start($)
+  expect(await rules($, 'MODEL', { agentId: 'kid' })).toBe('MODEL')
+  expect(await rules($, STORED, { agentId: 'kid' })).toBe('MODEL')
+  expect(await rules($, 'MODEL', { agentId: 'explorer' })).toBe(withUsage('MODEL', 'USAGE-RULES\nwhen to use probe'))
+})
+
+test('usage: a model attachment another hook left out stays out, and usage.md is not even read', async ($, on) => {
   const w = world($, on)
   await start($)
-  expect((await section($, 'env_info_model', null)).text).toBe(null)
+  expect(await rules($, null as any)).toBe(null)
   expect(w.reads.length).toBe(0)
 })
 
@@ -1026,7 +1048,7 @@ test('usage: /probe-mode switches the rules from the next prompt on, and later s
   expect(w.registered.commands.map((c: any) => c.name)).toEqual(['probe-mode'])
   expect(await rules($)).toBe(withUsage('MODEL', 'HEAD\nHANDY\nTAIL')) // handy until switched
   expect((await mode('save')).text).toMatch(/save にした/)
-  expect(w.invalidated).toEqual(['prompt.section']) // the cached section is asked again
+  expect(w.invalidated).toEqual(['prompt.attachment']) // the attachment's kept answer is asked again
   expect(await rules($)).toBe(withUsage('MODEL', 'HEAD\nSAVE\nTAIL'))
   expect((await mode('fast')).text).toMatch(/fast は指定できない/)
   expect((await mode('  ')).text).toMatch(/今は save/)
@@ -1035,7 +1057,7 @@ test('usage: /probe-mode switches the rules from the next prompt on, and later s
   expect(w.reads.length).toBe(3) // once per session, and again after a /probe-mode
 })
 
-test('usage: a mode usage.md has no lines for leaves the section as core computed it', async ($, on) => {
+test('usage: a mode usage.md has no lines for leaves the attachment as core made it', async ($, on) => {
   const w = world($, on, { usage: '<!-- save -->\nSAVE' })
   mock.store(on)
   await start($)
