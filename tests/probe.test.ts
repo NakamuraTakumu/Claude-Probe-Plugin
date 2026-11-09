@@ -223,6 +223,8 @@ test('session.start registers the hidden probe agent and the probe tool', async 
   expect(t.inputSchema.properties.run).toMatchObject({ type: 'object', required: ['name', 'input'], additionalProperties: false })
   expect(t.inputSchema.properties.run.description).toContain('権限の確認は自分で呼んだときと同じ')
   expect(t.inputSchema.properties.run.description).toContain('結果は加工されずに答えの前に返り')
+  expect(t.inputSchema.properties.run.description).toContain('迷うときに、その1回をここに入れる')
+  expect(t.inputSchema.properties.run.description).toContain('失敗したときの原因を questions で調べさせる')
   expect(t.inputSchema.properties.questions.description).toContain('複数書くと並列に処理され、結果はまとめて返る（最大16件同時')
   expect(t.inputSchema.properties.questions.description).toContain('同じディレクトリでビルドする問いは並べない')
   expect(t.inputSchema.properties.cwd.description).toBe('実行ディレクトリ。省略すると現在の作業ディレクトリ。')
