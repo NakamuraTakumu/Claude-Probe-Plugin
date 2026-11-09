@@ -565,7 +565,7 @@ test('rewrite: one request is enough; it goes to the same subagent, the new answ
   expect(r.result).toBe('結論: 短い')
   expect(w.sends.length).toBe(1)
   expect(w.sends[0]!.to).toBe('agent-1')
-  expect(w.sends[0]!.text).toBe('結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。')
+  expect(w.sends[0]!.text).toBe('結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した答えを、最終報告として前と同じように渡す。この依頼や経緯には触れない。')
   expect(w.sends[0]!.origin).toMatchObject({ kind: 'plugin' })
   expect(w.spawns.length).toBe(1) // no new subagent
   expect(w.stopped).toEqual([])
@@ -581,8 +581,8 @@ test('rewrite: the bound of max_chars is the one asked for, and it applies to ev
   const r = await probe($, { questions: ['long', 'fine', 'slow'], max_chars: 500 })
   expect(r.result).toBe(`〔問い 1〕\nnow short\n\n〔問い 2〕\n${longText(500)}\n\n〔問い 3〕\n${longText(100)}`)
   expect(w.sends.map((s) => [s.to, s.text])).toEqual([
-    ['agent-1', '結果が 700 字で、上限 500 字を超えた。結論を先に、500 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。'],
-    ['agent-3', '結果が 900 字で、上限 500 字を超えた。結論を先に、500 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。'],
+    ['agent-1', '結果が 700 字で、上限 500 字を超えた。結論を先に、500 字以内に書き直して。必要な情報だけ残す。書き直した答えを、最終報告として前と同じように渡す。この依頼や経緯には触れない。'],
+    ['agent-3', '結果が 900 字で、上限 500 字を超えた。結論を先に、500 字以内に書き直して。必要な情報だけ残す。書き直した答えを、最終報告として前と同じように渡す。この依頼や経緯には触れない。'],
   ])
 })
 
@@ -591,8 +591,8 @@ test('rewrite: two requests at most; if the third answer is still above the boun
   await start($)
   const r = await probe($, { questions: ['stubborn'] })
   expect(w.sends.map((s) => s.text)).toEqual([
-    '結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。',
-    '結果が 2300 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。',
+    '結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した答えを、最終報告として前と同じように渡す。この依頼や経緯には触れない。',
+    '結果が 2300 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した答えを、最終報告として前と同じように渡す。この依頼や経緯には触れない。',
   ])
   expect(r.result).toBe(`${longText(2000, 'y')}\n〔切り詰め：元は 2200 字〕`)
   expect(w.spawns.length).toBe(1)
@@ -1714,7 +1714,7 @@ test('formatResults numbers sections, caps long answers, writes no path lines', 
   expect(lengthOf('あい𠮷')).toBe(3)
   expect(formatResults([{ ok: true, text: '𠮷'.repeat(600) }], 500)).toBe('𠮷'.repeat(500) + '\n〔切り詰め：元は 600 字〕')
   expect(questionPrompt('調べて', 800)).toBe('調べて\n\n（結果の上限: 800 字）')
-  expect(rewriteRequest(2500, 2000)).toBe('結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。')
+  expect(rewriteRequest(2500, 2000)).toBe('結果が 2500 字で、上限 2000 字を超えた。結論を先に、2000 字以内に書き直して。必要な情報だけ残す。書き直した答えを、最終報告として前と同じように渡す。この依頼や経緯には触れない。')
 })
 
 test('a probe subagent\'s tool outputs reach it as they are, with no note after them', async ($, on) => {

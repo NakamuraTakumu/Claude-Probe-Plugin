@@ -127,7 +127,7 @@ export const AGENT_PROMPT = [
   '依頼主の代わりに作業場や Web を調べ、コマンドを実行して結果を返す。依頼されたことだけを最短の手順で行う。ファイルは変更しない。',
   'コマンドはなるべく1回の bash にまとめ、依存しない操作は並列に呼ぶ。「## 背景」は参考にし、足りなければ context ツールで依頼主の会話を必要な分だけ読む。',
   `Bash のファイルシステムは読み取り専用で、スクラッチパッドにも書けない。ネットワークにもつながらないので、Web は WebSearch と WebFetch で調べる。スクリプトはファイルに書かず、python3 - <<'EOF' のように標準入力で渡す。一時ファイルは mktemp で作れるが、そのコマンドが終わると消えるので、同じコマンドの中で使い切る。各 Bash 呼び出しは独立で、cd や環境変数は残らない。`,
-  `最後のメッセージがそのまま返る。結論を先に、既定では ${DEFAULT_MAX_CHARS} 字以内で、日本語で書く。依頼の末尾に「結果の上限: N 字」とあれば N 字が上限。長さや形の指定があればそれに従う。前置き・経過・使ったコマンド・注意書きは書かない。依頼主は答えを確かめずに使うので、確かめていない推測には「推測」と書き、失敗したことや分からなかったことはそのまま書く。見つからなかったときは、そう書いて、探した場所と検索語を1行で添える。`,
+  `答えは最終報告として、そのまま依頼主に渡る。結論を先に、既定では ${DEFAULT_MAX_CHARS} 字以内で、日本語で書く。依頼の末尾に「結果の上限: N 字」とあれば N 字が上限。長さや形の指定があればそれに従う。前置き・経過・使ったコマンド・注意書きは書かない。依頼主は答えを確かめずに使うので、確かめていない推測には「推測」と書き、失敗したことや分からなかったことはそのまま書く。見つからなかったときは、そう書いて、探した場所と検索語を1行で添える。`,
 ].join('\n\n')
 
 export const AGENT_SPEC = {
@@ -301,15 +301,15 @@ export function failureText(error) {
 
 /** What the subagent is asked when its answer is `n` characters long and the bound is `max`. */
 export function rewriteRequest(n, max) {
-  return `結果が ${n} 字で、上限 ${max} 字を超えた。結論を先に、${max} 字以内に書き直して。必要な情報だけ残す。書き直した結果だけを最後のメッセージに書く。この依頼や経緯には触れず、ほかの道具で送ることもしない。`
+  return `結果が ${n} 字で、上限 ${max} 字を超えた。結論を先に、${max} 字以内に書き直して。必要な情報だけ残す。書き直した答えを、最終報告として前と同じように渡す。この依頼や経緯には触れない。`
 }
 
 /** What a subagent past its time is asked for: its answer so far, by the usual rules, with no more lookups. */
 export function wrapupRequest(minutes, max) {
-  return `時間切れ（${minutes} 分）。これ以上は調べない（道具は断られる）。ここまでで分かったことを、ふつうの答えと同じ決まりで、結論を先に ${max} 字以内で書く。時間内に調べきれなかったことは、分からなかったこととして書く。書いた答えだけを最後のメッセージに書く。`
+  return `時間切れ（${minutes} 分）。これ以上は調べない（調べる道具は断られる）。ここまでで分かったことを、ふつうの答えと同じ決まりで、結論を先に ${max} 字以内で書く。時間内に調べきれなかったことは、分からなかったこととして書く。書いた答えを、最終報告としてふつうと同じように渡す。`
 }
 
-export const WRAPUP_DENY = 'probe の時間切れのため、道具は使えない。ここまでで分かったことを答えとして書き、最後のメッセージにする。'
+export const WRAPUP_DENY = 'probe の時間切れのため、調べる道具は使えない。ここまでで分かったことを、最終報告として渡す。'
 
 /** Whether `e` (a tool call) comes from a probe subagent past its time, and is not the hand-back. */
 function wrappingUp(e) {
