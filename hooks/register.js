@@ -1030,27 +1030,49 @@ async function runProbe($, e, signal, timeoutMs = QUESTION_TIMEOUT_MS) {
 //
 // After each probe call of the main loop, one line for the person, drawn on the call's own row (ui.render
 // ToolUse) once the estimate can be made; not sent to the model, not kept in the transcript file: what the
-// call saved in API prices against the main loop doing the same work itself. The calculation is the trial
-// script's of 2026-11-05 (docs/design.md, 節約の見積もり), read from the same transcript files: the main
-// loop's and each subagent's.
+// call saved in API prices, at each request's model's, against the main loop doing the same work itself.
+// The calculation is the trial script's of 2026-11-05 (docs/design.md, 節約の見積もり), read from the same
+// transcript files: the main loop's and each subagent's.
 
 // The line of each call, by its tool_use_id (a member per row: memberOf). Written by showSavings; the row's
 // drawing reads it, so the write draws that row again.
 const savingsShown = atom({ plugin: 'probe', key: 'savings' }, '')
 
-const PRICE_OPUS = { in: 4, w5: 5, w1h: 8, read: 0.2, out: 20 } // $ per million tokens, claude-opus-5-5
-const PRICE_HAIKU = [0.1, 0.5] // claude-haiku-5-5 input and output, a prompt of up to 100K tokens
-const PRICE_HAIKU_LONG = [0.5, 2.5] // above that
-const HAIKU_LONG_AT = 100_000
+// $ per million tokens by model: input, cache writes 5 m / 1 h, cache read, output (the claude-api skill and
+// the pricing page, 2026-11-11; Fable 5.2 / 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 also as the table in
+// Claude Code 2.1.322 has them). `long`: the prices of a request whose prompt is over `above` tokens, on all of it.
+const PRICES = {
+  'claude-fable-5-2': { in: 8, w5: 10, w1h: 16, read: 0.2, out: 40 },
+  'claude-fable-5-1': { in: 10, w5: 12.5, w1h: 20, read: 0.25, out: 50 },
+  'claude-fable-5': { in: 10, w5: 12.5, w1h: 20, read: 1, out: 50 },
+  'claude-opus-5-5': { in: 4, w5: 5, w1h: 8, read: 0.2, out: 20 },
+  'claude-opus-5': { in: 5, w5: 6.25, w1h: 10, read: 0.5, out: 25 },
+  'claude-sonnet-5-5': { in: 2, w5: 2.5, w1h: 4, read: 0.1, out: 10 },
+  'claude-sonnet-5': { in: 2, w5: 2.5, w1h: 4, read: 0.2, out: 10 },
+  'claude-haiku-5-5': {
+    in: 0.1, w5: 0.125, w1h: 0.2, read: 0.01, out: 0.5,
+    long: { above: 100_000, in: 0.5, w5: 0.625, w1h: 1, read: 0.05, out: 2.5 },
+  },
+  'claude-haiku-4-5': { in: 1, w5: 1.25, w1h: 2, read: 0.1, out: 5 },
+}
 const PER_M = 1_000_000
 const TRANSCRIPT_READ_MAX = 4 * 1024 * 1024 - 1024 // $.fs.read rejects over 4 MiB: a longer file is read from its end
 const SAVINGS_TRIES = 8 // estimates tried for a call (main-loop steps) before the request after it is given up on
 const SAVINGS_CAP = 64
 
-/** Prices of a claude-haiku-5-5 request by its prompt (input, cache writes 5 m / 1 h, cache read, output). */
-export function haikuPrice(prompt) {
-  const [i, o] = prompt > HAIKU_LONG_AT ? PRICE_HAIKU_LONG : PRICE_HAIKU
-  return { in: i, w5: i * 1.25, w1h: i * 2, read: i * 0.1, out: o }
+/**
+ * The key in PRICES of a model as a transcript names it: lower case, '5.5' as '5-5', without a provider
+ * prefix, '[1m]' or a date ('claude-haiku-4-5-20251001' is 'claude-haiku-4-5'); undefined for no Claude id.
+ */
+export function modelKey(model) {
+  const id = String(model ?? '').toLowerCase().replace(/(\d)\.(\d)/g, '$1-$2')
+  return /claude-[a-z]+-\d+(?:-\d{1,2})?(?!\d)/.exec(id)?.[0]
+}
+
+/** The prices of a request of `model` with a prompt of `prompt` tokens; undefined for a model not in PRICES. */
+export function priceOf(model, prompt) {
+  const p = PRICES[modelKey(model)]
+  return p?.long !== undefined && prompt > p.long.above ? p.long : p
 }
 
 /** The rows of a JSONL transcript; a line that does not parse (cut by a read from the end, half written) is left out. */
@@ -1136,11 +1158,12 @@ function resultText(b) {
 /** Writes of `tokens` to the cache, the 1-hour share at its price and the rest at the 5-minute one. */
 const costNew = (tokens, share1h, p) => (tokens * (share1h * p.w1h + (1 - share1h) * p.w5)) / PER_M
 
-/** What a subagent's requests cost at claude-haiku-5-5 prices. */
+/** What a subagent's requests cost, each at its model's prices (savingsOf has checked that they are in PRICES). */
 export function childCost(reqs) {
   let total = 0
   for (const r of reqs) {
-    const p = haikuPrice(r.prompt)
+    const p = priceOf(r.model, r.prompt)
+    if (p === undefined) continue // a request that used nothing (a '<synthetic>' message)
     total += (r.in * p.in + (r.w - r.w1h) * p.w5 + r.w1h * p.w1h + r.read * p.read + r.out * p.out) / PER_M
   }
   return total
@@ -1169,7 +1192,8 @@ export function probeGroupOf(prows, id) {
  *          2 what the work wrote to the cache, 4 the main loop's output (the subagent's stands in for it);
  *   spent: 1 the output of the request that called probe, 2 the subagents, 3 the answer written to the cache.
  * status: 'ok', 'pending' (the request after the result is not in the rows yet), 'interrupted' (the result
- * never reached the main loop), 'no-children', 'missing' (the call is not in the rows).
+ * never reached the main loop), 'no-children', 'missing' (the call is not in the rows), 'unknown-model' (a
+ * request of a model not in PRICES, named by `model`: no guess at its prices).
  */
 export function savingsOf(prows, ids, kidRows) {
   const preqs = requestsOf(prows)
@@ -1201,7 +1225,11 @@ export function savingsOf(prows, ids, kidRows) {
   if (group.some((t) => (result.get(t) ?? '').startsWith('[Tool call interrupted'))) return { status: 'interrupted' }
   const next = preqs.slice(i + 1).find((x) => x.before.some(([k, v]) => k === 'result' && group.includes(v)))
   if (next === undefined) return { status: 'pending' }
+  // The main loop's parts are at the prices of the model that called probe (a turn's requests run on one).
+  const unpriced = [r, ...kids.flat()].find((x) => priceOf(x.model, x.prompt) === undefined && x.prompt + x.out > 0)
+  if (unpriced !== undefined) return { status: 'unknown-model', model: String(unpriced.model) }
   const C = r.prompt
+  const pp = priceOf(r.model, C)
   let K = 0
   let save1b = 0
   let save2 = 0
@@ -1213,15 +1241,15 @@ export function savingsOf(prows, ids, kidRows) {
     const calling = answered ? steps.slice(0, -1) : steps
     K += calling.length
     for (const s of steps.slice(1)) {
-      save1b += (Math.max(s.prompt - c1 - s.new, 0) * PRICE_OPUS.read) / PER_M
-      save2 += costNew(s.new, share1h, PRICE_OPUS)
+      save1b += (Math.max(s.prompt - c1 - s.new, 0) * pp.read) / PER_M
+      save2 += costNew(s.new, share1h, pp)
     }
-    save4 += (calling.reduce((n, s) => n + s.out, 0) * PRICE_OPUS.out) / PER_M
+    save4 += (calling.reduce((n, s) => n + s.out, 0) * pp.out) / PER_M
   }
-  const save1a = (Math.max(K - 1, 0) * C * PRICE_OPUS.read) / PER_M
-  const add1 = (r.out * shareOut * PRICE_OPUS.out) / PER_M
+  const save1a = (Math.max(K - 1, 0) * C * pp.read) / PER_M
+  const add1 = (r.out * shareOut * pp.out) / PER_M
   const add2 = kids.reduce((s, reqs) => s + childCost(reqs), 0)
-  const add3 = costNew(next.new * shareRes, share1h, PRICE_OPUS)
+  const add3 = costNew(next.new * shareRes, share1h, pp)
   const net = save1a + save1b + save2 + save4 - add1 - add2 - add3
   return { status: 'ok', C, K, save1a, save1b, save2, save4, add1, add2, add3, net }
 }
@@ -1229,9 +1257,10 @@ export function savingsOf(prows, ids, kidRows) {
 /**
  * The line shown under a probe call: the saving in dollars, and as a share of what the main loop would have
  * paid without probe (the saved parts, 1a + 1b + 2 + 4; what both ways pay alike is in neither). Without
- * saved parts (no tool step to replay) there is no share to give.
+ * saved parts (no tool step to replay) there is no share to give. For a model not in PRICES, which one.
  */
 export function savingsLine(s) {
+  if (s.status === 'unknown-model') return `推定節約は不明(単価表にないモデル: ${s.model})`
   const without = s.save1a + s.save1b + s.save2 + s.save4
   const line = `推定節約${s.net.toFixed(2)}$(API相当)`
   return without > 0 ? `${line}　Probe未使用と比較し${Math.round((s.net / without) * 100)}%削減` : line
@@ -1295,7 +1324,7 @@ async function showSavings($) {
       continue
     }
     for (const t of ids) savingsPending.delete(t)
-    if (s.status === 'ok') {
+    if (s.status === 'ok' || s.status === 'unknown-model') {
       // Calls of one request share one estimate: on the row of the last of them, with how many it covers.
       const line = savingsLine(s) + (ids.length > 1 ? `（probe ${ids.length} 件分）` : '')
       await update($, memberOf(savingsShown, { requestId: ids[ids.length - 1] }), () => line)

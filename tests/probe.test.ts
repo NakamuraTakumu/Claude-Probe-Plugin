@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { recordRows, requestsOf, savingsOf, savingsLine, probeGroupOf } from '../hooks/register.js'
+import { recordRows, requestsOf, savingsOf, savingsLine, probeGroupOf, modelKey, priceOf } from '../hooks/register.js'
 import { atCapacity } from '../hooks/register.js'
 import { AGENT_PROMPT, AGENT_SPEC, BWRAP_ARGS, BASH_DEFAULT_TIMEOUT_MS, CONTEXT_SPEC, TOOL_SPEC, failureText, park, withUsage, withoutStoredUsage, usageFor, bodyOf, formatContext, formatResults, handbackSendersOf, lengthOf, outcomeOf, questionPrompt, recentExchange, rewriteRequest, escapeMarks, SANDBOXES, WRAPUP_DENY, wrapupRequest, onlyStubs, shQuote, stopSeconds, stoppedNote, taskIdsOf, wrapCommand } from '../hooks/register.js'
 
@@ -1817,7 +1817,8 @@ const tokens = (input: number, w: number, read: number, out: number, w1h = 0) =>
   input_tokens: input, cache_creation_input_tokens: w, cache_read_input_tokens: read, output_tokens: out,
   cache_creation: { ephemeral_1h_input_tokens: w1h, ephemeral_5m_input_tokens: w - w1h },
 })
-const said = (id: string, u: any, content: any[]) => ({ type: 'assistant', timestamp: '2026-11-05T00:00:00Z', message: { id, role: 'assistant', usage: u, content } })
+const said = (id: string, u: any, content: any[], model = 'claude-opus-5-5') => ({ type: 'assistant', timestamp: '2026-11-05T00:00:00Z', message: { id, model, role: 'assistant', usage: u, content } })
+const kidSaid = (id: string, u: any, content: any[]) => said(id, u, content, 'claude-haiku-5-5')
 const heard = (content: any) => ({ type: 'user', timestamp: '2026-11-05T00:00:00Z', message: { role: 'user', content } })
 // Equal to 12 decimal places (the test framework has no toBeCloseTo).
 const near = (a: number, b: number) => expect(Number(a.toFixed(12))).toBe(Number(b.toFixed(12)))
@@ -1834,11 +1835,11 @@ const PARENT = [
 // A subagent: two tool steps, then its answer.
 const CHILD = [
   heard('q'),
-  said('c1', tokens(1, 500, 0, 20), [{ type: 'tool_use', id: 'b1', name: 'Bash', input: { command: 'ls' } }]),
+  kidSaid('c1', tokens(1, 500, 0, 20), [{ type: 'tool_use', id: 'b1', name: 'Bash', input: { command: 'ls' } }]),
   heard([{ type: 'tool_result', tool_use_id: 'b1', content: 'x' }]),
-  said('c2', tokens(1, 300, 500, 40), [{ type: 'tool_use', id: 'b2', name: 'Bash', input: { command: 'pwd' } }]),
+  kidSaid('c2', tokens(1, 300, 500, 40), [{ type: 'tool_use', id: 'b2', name: 'Bash', input: { command: 'pwd' } }]),
   heard([{ type: 'tool_result', tool_use_id: 'b2', content: 'y' }]),
-  said('c3', tokens(1, 400, 800, 30), [{ type: 'text', text: 'answer' }]),
+  kidSaid('c3', tokens(1, 400, 800, 30), [{ type: 'text', text: 'answer' }]),
 ]
 
 test('savings: the trial script\'s calculation, step by step', () => {
@@ -1879,6 +1880,39 @@ test('savings: no line while the request after the result is not written, for an
   expect(savingsOf(PARENT, ['toolu_x'], [CHILD]).status).toBe('missing')
   expect(probeGroupOf(PARENT, 'toolu_x')).toBe(undefined)
   expect(recordRows('{"type":"user"}\n{"type":"assi')).toEqual([{ type: 'user' }]) // a half-written line is left out
+})
+
+const onModel = (rows: any[], model: string) => rows.map((d) => (d.type === 'assistant' ? { ...d, message: { ...d.message, model } } : d))
+
+test('savings: the main loop\'s parts at the prices of the model that called probe, a subagent\'s at its own model\'s', () => {
+  const s: any = savingsOf(onModel(PARENT, 'claude-fable-5-2'), ['toolu_p'], [CHILD])
+  expect(s.status).toBe('ok')
+  near(s.save1a, (1 * 1102 * 0.2) / 1e6) // Fable 5.2 reads the cache at Opus 5.5's price
+  near(s.save1b, (299 * 0.2) / 1e6)
+  near(s.save2, ((301 + 401) * 16) / 1e6) // and writes it, and outputs, at twice Opus 5.5's
+  near(s.save4, ((20 + 40) * 40) / 1e6)
+  near(s.add1, (50 * 40) / 1e6)
+  near(s.add2, (72.6 + 62.6 + 73.1) / 1e6) // the subagent still on Haiku
+  near(s.add3, (302 * 16) / 1e6)
+  // a subagent on Sonnet 5.5: input 2, 5-minute write 2.5, read 0.1, output 10
+  near((savingsOf(PARENT, ['toolu_p'], [onModel(CHILD, 'claude-sonnet-5-5')]) as any).add2, (1452 + 1202 + 1382) / 1e6)
+})
+
+test('savings: for a model not in the price table, which one instead of a guess; a request that used nothing needs no price', () => {
+  const s: any = savingsOf(onModel(PARENT, 'claude-fable-5-3'), ['toolu_p'], [CHILD])
+  expect(s).toEqual({ status: 'unknown-model', model: 'claude-fable-5-3' })
+  expect(savingsLine(s)).toBe('推定節約は不明(単価表にないモデル: claude-fable-5-3)')
+  expect(savingsOf(PARENT, ['toolu_p'], [onModel(CHILD, 'claude-mystery-1')]).status).toBe('unknown-model')
+  const failed = [...CHILD, said('x1', tokens(0, 0, 0, 0), [{ type: 'text', text: 'API Error' }], '<synthetic>')]
+  expect(savingsOf(PARENT, ['toolu_p'], [failed])).toEqual(savingsOf(PARENT, ['toolu_p'], [CHILD]))
+})
+
+test('modelKey and priceOf: an id as a transcript or a provider writes it; Haiku 5.5 over 100K tokens at its long prices', () => {
+  const ids = ['claude-fable-5-2', 'claude-opus-5-5[1m]', 'Claude-Opus-5.5', 'us.anthropic.claude-sonnet-5-5-v1:0', 'claude-haiku-4-5-20251001', 'claude-fable-5', 'claude-fable-5-3', '<synthetic>', undefined]
+  expect(ids.map(modelKey)).toEqual(['claude-fable-5-2', 'claude-opus-5-5', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-4-5', 'claude-fable-5', 'claude-fable-5-3', undefined, undefined])
+  expect(priceOf('claude-fable-5-3', 1)).toBe(undefined) // not Fable 5's
+  expect(priceOf('claude-haiku-5-5', 100_000).in).toBe(0.1)
+  expect(priceOf('claude-haiku-5-5', 100_001)).toEqual({ above: 100_000, in: 0.5, w5: 0.625, w1h: 1, read: 0.05, out: 2.5 })
 })
 
 test('savingsLine: the saving in dollars, and its share of what the main loop would have paid without probe', () => {
